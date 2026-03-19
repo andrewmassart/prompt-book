@@ -19,6 +19,10 @@ const styles = {
     background: "var(--bg-input)",
     cursor: "pointer",
     userSelect: "none" as const,
+    border: "none",
+    width: "100%",
+    font: "inherit",
+    textAlign: "left" as const,
   },
   arrow: {
     fontSize: "0.7em",
@@ -46,17 +50,21 @@ const styles = {
   },
 };
 
-export function ThinkingBlock({ text }: ThinkingBlockProps) {
+export function ThinkingBlock({ text }: Readonly<ThinkingBlockProps>) {
   const [open, setOpen] = useState(false);
 
   return (
     <div style={styles.container}>
-      <div style={styles.header} onClick={() => setOpen(!open)}>
+      <button
+        type="button"
+        style={styles.header}
+        onClick={() => setOpen(!open)}
+      >
         <span style={{ ...styles.arrow, transform: open ? "rotate(90deg)" : "none" }}>
           &#9654;
         </span>
         <span style={styles.label}>Thinking...</span>
-      </div>
+      </button>
       {open && <div style={styles.body}>{text}</div>}
     </div>
   );

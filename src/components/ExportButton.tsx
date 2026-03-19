@@ -22,7 +22,7 @@ const styles = {
   },
 };
 
-export function ExportButton({ session }: ExportButtonProps) {
+export function ExportButton({ session }: Readonly<ExportButtonProps>) {
   const [exporting, setExporting] = useState(false);
 
   const handleExport = async () => {

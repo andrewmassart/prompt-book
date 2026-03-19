@@ -27,6 +27,10 @@ const styles = {
     background: "var(--bg-input)",
     cursor: "pointer",
     userSelect: "none" as const,
+    border: "none",
+    width: "100%",
+    font: "inherit",
+    textAlign: "left" as const,
   },
   arrow: {
     fontSize: "0.7em",
@@ -87,7 +91,7 @@ function formatToolDuration(ms: number): string {
   return `${minutes} m ${remainingSeconds} s`;
 }
 
-export function ToolCallBlock({ block }: ToolCallBlockProps) {
+export function ToolCallBlock({ block }: Readonly<ToolCallBlockProps>) {
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
@@ -101,7 +105,11 @@ export function ToolCallBlock({ block }: ToolCallBlockProps) {
 
   return (
     <div style={styles.container}>
-      <div style={styles.header} onClick={() => setOpen(!open)}>
+      <button
+        type="button"
+        style={styles.header}
+        onClick={() => setOpen(!open)}
+      >
         <span style={{ ...styles.arrow, transform: open ? "rotate(90deg)" : "none" }}>
           &#9654;
         </span>
@@ -109,7 +117,7 @@ export function ToolCallBlock({ block }: ToolCallBlockProps) {
         {block.durationMs !== undefined && (
           <span style={styles.duration}>{formatToolDuration(block.durationMs)}</span>
         )}
-      </div>
+      </button>
       {open && (
         <div style={styles.body}>
           <div style={styles.label}>Input</div>

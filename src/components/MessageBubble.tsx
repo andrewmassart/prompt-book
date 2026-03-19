@@ -199,7 +199,7 @@ function renderBlock(block: ContentBlock, index: number) {
   }
 }
 
-export function MessageBubble({ message }: MessageBubbleProps) {
+export function MessageBubble({ message }: Readonly<MessageBubbleProps>) {
   const color = roleColors[message.role] || "var(--border-color)";
   const modeLabel = modeLabels[message.mode];
   const modeColor = modeColors[message.mode];
@@ -211,14 +211,10 @@ export function MessageBubble({ message }: MessageBubbleProps) {
     borderLeftColor: message.isAgent ? "var(--agent-border)" : color,
     ...(message.isAgent ? styles.agentBubble : {}),
     ...(message.isMeta ? styles.metaBubble : {}),
-    cursor: isLong && expanded ? "pointer" : undefined,
   };
 
   return (
-    <div
-      style={bubbleStyle}
-      onClick={isLong && expanded ? () => setExpanded(false) : undefined}
-    >
+    <div style={bubbleStyle}>
       <div style={styles.headerRow}>
         <span style={{ ...styles.roleLabel, color: message.isAgent ? "var(--agent-border)" : color }}>
           {message.isAgent ? `agent / ${message.role}` : message.role}
@@ -265,6 +261,14 @@ export function MessageBubble({ message }: MessageBubbleProps) {
           onClick={() => setExpanded(true)}
         >
           Show more
+        </button>
+      )}
+      {isLong && expanded && (
+        <button
+          style={{ ...styles.expandBtn, color }}
+          onClick={() => setExpanded(false)}
+        >
+          Show less
         </button>
       )}
     </div>

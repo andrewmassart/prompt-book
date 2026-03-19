@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { SessionSummary } from "../lib/types";
 
 interface SessionListProps {
@@ -57,6 +58,11 @@ const styles = {
     cursor: "pointer",
     transition: "background 0.15s",
     border: "1px solid transparent",
+    width: "100%",
+    textAlign: "left" as const,
+    font: "inherit",
+    background: "none",
+    display: "block",
   },
   itemSelected: {
     background: "var(--accent-subtle)",
@@ -108,7 +114,7 @@ function formatDate(iso?: string): string {
   }
 }
 
-function HeaderButton({ onClick, disabled, label }: { onClick: () => void; disabled?: boolean; label: string }) {
+function HeaderButton({ onClick, disabled, label }: Readonly<{ onClick: () => void; disabled?: boolean; label: string }>) {
   return (
     <button
       style={styles.refreshBtn}
@@ -137,7 +143,9 @@ export function SessionList({
   onRefresh,
   onOpenFile,
   onExport,
-}: SessionListProps) {
+}: Readonly<SessionListProps>) {
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+
   return (
     <div style={styles.container}>
       <div style={styles.header}>
@@ -157,23 +165,17 @@ export function SessionList({
         )}
 
         {sessions.map((s) => (
-          <div
+          <button
             key={s.id}
+            type="button"
             style={{
               ...styles.item,
               ...(selectedId === s.id ? styles.itemSelected : {}),
+              ...(hoveredId === s.id && selectedId !== s.id ? styles.itemHover : {}),
             }}
             onClick={() => onSelect(s)}
-            onMouseEnter={(e) => {
-              if (selectedId !== s.id) {
-                Object.assign(e.currentTarget.style, styles.itemHover);
-              }
-            }}
-            onMouseLeave={(e) => {
-              if (selectedId !== s.id) {
-                e.currentTarget.style.background = "";
-              }
-            }}
+            onMouseEnter={() => setHoveredId(s.id)}
+            onMouseLeave={() => setHoveredId(null)}
           >
             <div style={styles.itemTitle}>{s.title || "Untitled"}</div>
             <div style={styles.itemMeta}>
@@ -181,7 +183,7 @@ export function SessionList({
               <span>{s.messageCount} msgs</span>
               {s.model && <span>{s.model.split("-").slice(0, 2).join("-")}</span>}
             </div>
-          </div>
+          </button>
         ))}
       </div>
     </div>

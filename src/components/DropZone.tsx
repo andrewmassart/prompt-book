@@ -1,4 +1,4 @@
-import { useState, useCallback, type DragEvent, type ReactNode } from "react";
+import { useState, useRef, useCallback, type DragEvent, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 
 interface DropZoneProps {
@@ -31,27 +31,22 @@ const styles = {
   },
 };
 
-export function DropZone({ onFileContent, children }: DropZoneProps) {
+export function DropZone({ onFileContent, children }: Readonly<DropZoneProps>) {
   const [dragging, setDragging] = useState(false);
-  const [, setDragCounter] = useState(0);
+  const dragCounterRef = useRef(0);
 
   const handleDragEnter = useCallback((e: DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setDragCounter((c) => {
-      if (c === 0) setDragging(true);
-      return c + 1;
-    });
+    dragCounterRef.current++;
+    if (dragCounterRef.current === 1) setDragging(true);
   }, []);
 
   const handleDragLeave = useCallback((e: DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setDragCounter((c) => {
-      const next = c - 1;
-      if (next === 0) setDragging(false);
-      return next;
-    });
+    dragCounterRef.current--;
+    if (dragCounterRef.current === 0) setDragging(false);
   }, []);
 
   const handleDragOver = useCallback((e: DragEvent) => {
@@ -64,21 +59,14 @@ export function DropZone({ onFileContent, children }: DropZoneProps) {
       e.preventDefault();
       e.stopPropagation();
       setDragging(false);
-      setDragCounter(0);
+      dragCounterRef.current = 0;
 
       const files = e.dataTransfer?.files;
       if (!files || files.length === 0) return;
 
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
+      for (const file of Array.from(files)) {
         if (file.name.endsWith(".jsonl")) {
-          const reader = new FileReader();
-          reader.onload = () => {
-            if (typeof reader.result === "string") {
-              onFileContent(file.name, reader.result);
-            }
-          };
-          reader.readAsText(file);
+          void file.text().then((content) => onFileContent(file.name, content));
           return;
         }
       }
@@ -88,6 +76,8 @@ export function DropZone({ onFileContent, children }: DropZoneProps) {
 
   return (
     <div
+      role="region"
+      aria-label="File drop zone"
       style={styles.wrapper}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
@@ -109,5 +99,5 @@ export async function openJsonlFile(): Promise<string | null> {
     filters: [{ name: "JSONL", extensions: ["jsonl"] }],
     multiple: false,
   });
-  return path as string | null;
+  return path;
 }

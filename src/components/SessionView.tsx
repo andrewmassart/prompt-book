@@ -121,7 +121,7 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
-export function SessionView({ session, loading, error }: SessionViewProps) {
+export function SessionView({ session, loading, error }: Readonly<SessionViewProps>) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showFab, setShowFab] = useState(false);
 

@@ -95,7 +95,7 @@ function App() {
       <div style={styles.layout}>
         <div style={styles.sidebar}>
           <SessionList
-            sessions={sessions}
+            sessions={sessions.filter((s) => s.messageCount > 0)}
             loading={discoverLoading}
             error={discoverError}
             selectedId={selectedId}

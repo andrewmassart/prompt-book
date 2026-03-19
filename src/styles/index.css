@@ -1,0 +1,64 @@
+:root {
+  --bg-primary: #161616;
+  --bg-secondary: #1e1e1e;
+  --bg-tertiary: #2a2a2a;
+  --bg-input: #121212;
+  --text-primary: #d4d4d4;
+  --text-secondary: #999999;
+  --text-muted: #6c6c6c;
+  --accent: #6b9eff;
+  --accent-dim: #4a7adc;
+  --accent-subtle: rgba(107, 158, 255, 0.08);
+  --role-user: #e0a458;
+  --role-assistant: #6b9eff;
+  --role-system: #5a5a5a;
+  --role-tool: #e0a458;
+  --mode-plan: #6bcf7f;
+  --mode-auto: #b48eda;
+  --agent-border: #7c6ba5;
+  --error: #f87171;
+  --border-color: #2e2e2e;
+  --border-subtle: #232323;
+  --sidebar-width: 320px;
+  --font-mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+}
+
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  background-color: var(--bg-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #444;
+}

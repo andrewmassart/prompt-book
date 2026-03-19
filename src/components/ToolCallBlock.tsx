@@ -78,6 +78,15 @@ const styles = {
   },
 };
 
+function formatToolDuration(ms: number): string {
+  if (ms < 1000) return `${ms} ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  return `${minutes} m ${remainingSeconds} s`;
+}
+
 export function ToolCallBlock({ block }: ToolCallBlockProps) {
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState(false);
@@ -98,7 +107,7 @@ export function ToolCallBlock({ block }: ToolCallBlockProps) {
         </span>
         <span style={styles.toolName}>{block.toolName}</span>
         {block.durationMs !== undefined && (
-          <span style={styles.duration}>{block.durationMs}ms</span>
+          <span style={styles.duration}>{formatToolDuration(block.durationMs)}</span>
         )}
       </div>
       {open && (

@@ -105,6 +105,7 @@ pub fn parse_copilot_session(path: &Path) -> Result<Session, AppError> {
     }
 
     let title = title_from_first_user_message(&messages);
+    super::calculate_durations(&mut messages);
 
     Ok(Session {
         id: session_id,
@@ -230,6 +231,7 @@ fn parse_session_event(
         mode: mode.clone(),
         is_agent: false,
         is_meta: false,
+        duration_ms: None,
     }
 }
 
@@ -251,6 +253,7 @@ fn parse_user_message(
         mode: mode.clone(),
         is_agent: false,
         is_meta: false,
+        duration_ms: None,
     }
 }
 
@@ -270,6 +273,7 @@ fn parse_assistant_message(
                 mode: mode.clone(),
                 is_agent: false,
                 is_meta: false,
+                duration_ms: None,
             },
             Vec::new(),
         );
@@ -331,6 +335,7 @@ fn parse_assistant_message(
         mode: mode.clone(),
         is_agent,
         is_meta: false,
+        duration_ms: None,
     };
 
     (msg, tool_requests)

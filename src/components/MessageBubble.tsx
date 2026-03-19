@@ -67,6 +67,11 @@ const styles = {
     letterSpacing: "normal" as const,
     textTransform: "none" as const,
   },
+  duration: {
+    fontSize: "0.75em",
+    color: "var(--text-muted)",
+    marginLeft: "auto",
+  },
   badge: {
     fontSize: "0.6em",
     fontWeight: 700,
@@ -136,6 +141,15 @@ function formatTime(iso?: string): string {
   } catch {
     return "";
   }
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms} ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  return `${minutes} m ${remainingSeconds} s`;
 }
 
 function estimateLineCount(content: ContentBlock[]): number {
@@ -233,6 +247,9 @@ export function MessageBubble({ message }: MessageBubbleProps) {
         )}
         {message.timestamp && (
           <span style={styles.timestamp}>{formatTime(message.timestamp)}</span>
+        )}
+        {message.durationMs != null && (
+          <span style={styles.duration}>{formatDuration(message.durationMs)}</span>
         )}
       </div>
       <div style={{

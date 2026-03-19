@@ -44,6 +44,8 @@ pub struct Message {
     pub is_agent: bool,
     #[serde(default)]
     pub is_meta: bool,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

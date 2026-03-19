@@ -17,6 +17,7 @@ export interface Message {
   mode: MessageMode;
   isAgent: boolean;
   isMeta: boolean;
+  durationMs?: number;
 }
 
 export interface TokenUsage {

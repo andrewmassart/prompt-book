@@ -95,6 +95,8 @@ pub fn parse_claude_session(path: &Path) -> Result<Session, AppError> {
         title = title_from_path(path);
     }
 
+    super::calculate_durations(&mut messages);
+
     Ok(Session {
         id: session_id,
         source: SessionSource::ClaudeCode,
@@ -315,6 +317,9 @@ fn build_message_with_mode(
             .get("isMeta")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        duration_ms: record
+            .get("durationMs")
+            .and_then(|v| v.as_u64()),
     }
 }
 

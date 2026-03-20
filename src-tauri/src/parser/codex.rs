@@ -7,6 +7,15 @@ use crate::model::{
     ContentBlock, Message, MessageMode, Role, Session, SessionMetadata, SessionSource, TokenUsage,
 };
 
+/// Parse a Codex CLI session JSONL file.
+///
+/// Real Codex format uses these top-level event types:
+/// - `session_meta`     — session ID, cwd, git info, model_provider
+/// - `event_msg`        — payload.type: task_started, user_message, task_complete,
+///                         token_count, agent_message, thread_rolled_back
+/// - `response_item`    — payload.type: message (role: user/assistant/developer),
+///                         reasoning, function_call, function_call_output
+/// - `turn_context`     — model, collaboration_mode, turn_id
 pub fn parse_codex_session(path: &Path) -> Result<Session, AppError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -16,8 +25,18 @@ pub fn parse_codex_session(path: &Path) -> Result<Session, AppError> {
     let mut model: Option<String> = None;
     let mut messages: Vec<Message> = Vec::new();
     let mut usage_accumulator = UsageAccumulator::new();
+    let mut current_mode = MessageMode::Normal;
+    let mut metadata = SessionMetadata {
+        working_directory: None,
+        git_branch: None,
+        slug: None,
+        repository: None,
+    };
+
+    // Collect assistant content blocks between task_started and task_complete
     let mut turn_items: Vec<ContentBlock> = Vec::new();
     let mut turn_timestamp: Option<String> = None;
+    let mut in_turn = false;
 
     for line in reader.lines() {
         let line = line?;
@@ -31,182 +50,316 @@ pub fn parse_codex_session(path: &Path) -> Result<Session, AppError> {
         };
 
         let event_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let timestamp = extract_timestamp(&record);
+        let payload = record.get("payload");
 
         match event_type {
-            "thread.started" => {
-                session_id = record
-                    .get("thread_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                started_at = record
-                    .get("created_at")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
-            "message" => {
-                let role = record
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("");
-                if role == "user" {
-                    let content = extract_user_content_blocks(&record);
-                    messages.push(Message {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        role: Role::User,
-                        timestamp: extract_timestamp(&record),
-                        content,
-                        mode: MessageMode::Normal,
-                        is_agent: false,
-                        is_meta: false,
-                        duration_ms: None,
-                    });
-                }
-            }
-            "turn.started" => {
-                turn_items.clear();
-                turn_timestamp = extract_timestamp(&record);
-            }
-            "item.completed" => {
-                if let Some(item) = record.get("item") {
-                    let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match item_type {
-                        "agent_message" => {
-                            if let Some(text) = extract_item_text(item) {
-                                if !text.is_empty() {
-                                    turn_items.push(ContentBlock::Text { text });
-                                }
-                            }
-                            if model.is_none() {
-                                model = item
-                                    .get("model")
-                                    .and_then(|m| m.as_str())
-                                    .map(String::from);
-                            }
-                        }
-                        "reasoning" => {
-                            if let Some(text) = extract_item_text(item) {
-                                if !text.is_empty() {
-                                    turn_items.push(ContentBlock::Thinking { text });
-                                }
-                            }
-                        }
-                        "command_execution" => {
-                            let tool_name = "command_execution".to_string();
-                            let command = item
-                                .get("command")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            let output = item
-                                .get("output")
-                                .and_then(|o| o.as_str())
-                                .map(String::from);
-                            turn_items.push(ContentBlock::ToolUse {
-                                tool_name,
-                                input: command,
-                                output,
-                                duration_ms: None,
-                            });
-                        }
-                        "file_change" => {
-                            let tool_name = "file_change".to_string();
-                            let mut input = serde_json::Map::new();
-                            if let Some(f) = item.get("file").and_then(|f| f.as_str()) {
-                                input.insert(
-                                    "file".to_string(),
-                                    serde_json::Value::String(f.to_string()),
-                                );
-                            }
-                            if let Some(a) = item.get("action").and_then(|a| a.as_str()) {
-                                input.insert(
-                                    "action".to_string(),
-                                    serde_json::Value::String(a.to_string()),
-                                );
-                            }
-                            let diff = item
-                                .get("diff")
-                                .and_then(|d| d.as_str())
-                                .map(String::from);
-                            turn_items.push(ContentBlock::ToolUse {
-                                tool_name,
-                                input: serde_json::Value::Object(input),
-                                output: diff,
-                                duration_ms: None,
-                            });
-                        }
-                        "mcp_tool_call" => {
-                            let tool_name = item
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("mcp_tool")
-                                .to_string();
-                            let input = item
-                                .get("arguments")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            let output = item
-                                .get("result")
-                                .and_then(|r| r.as_str())
-                                .map(String::from);
-                            turn_items.push(ContentBlock::ToolUse {
-                                tool_name,
-                                input,
-                                output,
-                                duration_ms: None,
-                            });
-                        }
-                        _ => {}
+            "session_meta" => {
+                if let Some(p) = payload {
+                    session_id = p
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    started_at = p
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .or(timestamp.clone());
+                    metadata.working_directory = p
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    if let Some(git) = p.get("git") {
+                        metadata.git_branch = git
+                            .get("branch")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        metadata.repository = git
+                            .get("repository_url")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
                     }
                 }
             }
-            "turn.completed" => {
-                if !turn_items.is_empty() {
-                    messages.push(Message {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        role: Role::Assistant,
-                        timestamp: turn_timestamp.take(),
-                        content: std::mem::take(&mut turn_items),
-                        mode: MessageMode::Normal,
-                        is_agent: false,
-                        is_meta: false,
-                        duration_ms: None,
-                    });
+
+            "turn_context" => {
+                if let Some(p) = payload {
+                    if model.is_none() {
+                        model = p
+                            .get("model")
+                            .and_then(|m| m.as_str())
+                            .map(String::from);
+                    }
+                    // Extract collaboration mode
+                    if let Some(mode_str) = p
+                        .get("collaboration_mode")
+                        .and_then(|cm| cm.get("mode"))
+                        .and_then(|m| m.as_str())
+                    {
+                        current_mode = match mode_str {
+                            "plan" => MessageMode::Plan,
+                            "auto" | "autopilot" | "full-auto" => MessageMode::Auto,
+                            _ => MessageMode::Normal,
+                        };
+                    }
                 }
-                accumulate_turn_usage(&record, &mut usage_accumulator);
             }
-            "turn.failed" | "error" => {
-                // Flush any pending turn items first
-                if !turn_items.is_empty() {
-                    messages.push(Message {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        role: Role::Assistant,
-                        timestamp: turn_timestamp.take(),
-                        content: std::mem::take(&mut turn_items),
-                        mode: MessageMode::Normal,
-                        is_agent: false,
-                        is_meta: false,
-                        duration_ms: None,
-                    });
+
+            "event_msg" => {
+                let Some(p) = payload else { continue };
+                let msg_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                match msg_type {
+                    "task_started" => {
+                        in_turn = true;
+                        turn_items.clear();
+                        turn_timestamp = timestamp.clone();
+                        // Update mode from collaboration_mode_kind
+                        if let Some(mode_str) = p
+                            .get("collaboration_mode_kind")
+                            .and_then(|m| m.as_str())
+                        {
+                            current_mode = match mode_str {
+                                "plan" => MessageMode::Plan,
+                                "auto" | "autopilot" | "full-auto" => MessageMode::Auto,
+                                _ => MessageMode::Normal,
+                            };
+                        }
+                    }
+                    "user_message" => {
+                        let mut content = Vec::new();
+                        if let Some(text) = p.get("message").and_then(|m| m.as_str()) {
+                            if !text.is_empty() {
+                                content.push(ContentBlock::Text {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                        // Handle images
+                        if let Some(images) = p.get("images").and_then(|i| i.as_array()) {
+                            for img in images {
+                                if let Some(url) = img.as_str() {
+                                    content.push(ContentBlock::Image {
+                                        source: url.to_string(),
+                                    });
+                                } else if let Some(url) = img.get("url").and_then(|u| u.as_str()) {
+                                    content.push(ContentBlock::Image {
+                                        source: url.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        if content.is_empty() {
+                            content.push(ContentBlock::Text {
+                                text: String::new(),
+                            });
+                        }
+                        messages.push(Message {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            role: Role::User,
+                            timestamp: timestamp.clone(),
+                            content,
+                            mode: current_mode.clone(),
+                            is_agent: false,
+                            is_meta: false,
+                            duration_ms: None,
+                        });
+                    }
+                    "task_complete" => {
+                        if in_turn && !turn_items.is_empty() {
+                            messages.push(Message {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                role: Role::Assistant,
+                                timestamp: turn_timestamp.take(),
+                                content: std::mem::take(&mut turn_items),
+                                mode: current_mode.clone(),
+                                is_agent: false,
+                                is_meta: false,
+                                duration_ms: None,
+                            });
+                        }
+                        in_turn = false;
+                    }
+                    "agent_message" => {
+                        if let Some(text) = p.get("message").and_then(|m| m.as_str()) {
+                            if !text.is_empty() {
+                                turn_items.push(ContentBlock::Text {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    "token_count" => {
+                        if let Some(info) = p.get("info") {
+                            if let Some(last) = info.get("last_token_usage") {
+                                usage_accumulator.add(last);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                let error_text = record
-                    .get("message")
-                    .or_else(|| record.get("error"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown error")
-                    .to_string();
-                messages.push(Message {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    role: Role::System,
-                    timestamp: extract_timestamp(&record),
-                    content: vec![ContentBlock::Text { text: error_text }],
-                    mode: MessageMode::Normal,
-                    is_agent: false,
-                    is_meta: false,
-                    duration_ms: None,
-                });
             }
+
+            "response_item" => {
+                let Some(p) = payload else { continue };
+                let item_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                match item_type {
+                    "message" => {
+                        let role = p.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                        match role {
+                            "assistant" => {
+                                // Extract text from content array
+                                if let Some(arr) = p.get("content").and_then(|c| c.as_array()) {
+                                    for block in arr {
+                                        let bt = block
+                                            .get("type")
+                                            .and_then(|t| t.as_str())
+                                            .unwrap_or("");
+                                        match bt {
+                                            "output_text" => {
+                                                if let Some(text) =
+                                                    block.get("text").and_then(|t| t.as_str())
+                                                {
+                                                    if !text.is_empty() {
+                                                        turn_items.push(ContentBlock::Text {
+                                                            text: text.to_string(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            // user/developer messages are context replay, skip
+                            _ => {}
+                        }
+                    }
+                    "reasoning" => {
+                        // summary is an array of summary strings
+                        if let Some(summary) = p.get("summary").and_then(|s| s.as_array()) {
+                            let texts: Vec<String> = summary
+                                .iter()
+                                .filter_map(|item| {
+                                    item.get("text")
+                                        .and_then(|t| t.as_str())
+                                        .or_else(|| item.as_str())
+                                        .map(String::from)
+                                })
+                                .collect();
+                            let text = texts.join("\n");
+                            if !text.is_empty() {
+                                turn_items.push(ContentBlock::Thinking { text });
+                            }
+                        }
+                        // Fallback: content field (may be encrypted/null)
+                        if let Some(text) = p.get("content").and_then(|c| c.as_str()) {
+                            if !text.is_empty()
+                                && p.get("encrypted_content").is_none()
+                            {
+                                turn_items.push(ContentBlock::Thinking {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    "function_call" => {
+                        let tool_name = p
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let call_id = p
+                            .get("call_id")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = parse_arguments(p);
+                        turn_items.push(ContentBlock::ToolUse {
+                            tool_name: format!("{}:{}", tool_name, call_id),
+                            input,
+                            output: None,
+                            duration_ms: None,
+                        });
+                    }
+                    "function_call_output" => {
+                        let call_id = p
+                            .get("call_id")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+                        let output = p
+                            .get("output")
+                            .and_then(|o| o.as_str())
+                            .map(String::from);
+
+                        // Find the matching function_call ToolUse and attach output
+                        let suffix = format!(":{}", call_id);
+                        let mut found = false;
+                        for item in turn_items.iter_mut().rev() {
+                            if let ContentBlock::ToolUse {
+                                tool_name,
+                                output: ref mut out,
+                                ..
+                            } = item
+                            {
+                                if tool_name.ends_with(&suffix) && out.is_none() {
+                                    // Restore clean tool name
+                                    *tool_name = tool_name
+                                        .strip_suffix(&suffix)
+                                        .unwrap_or(tool_name)
+                                        .to_string();
+                                    *out = output.clone();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // Also check already-flushed messages
+                        if !found {
+                            for msg in messages.iter_mut().rev() {
+                                for item in msg.content.iter_mut().rev() {
+                                    if let ContentBlock::ToolUse {
+                                        tool_name,
+                                        output: ref mut out,
+                                        ..
+                                    } = item
+                                    {
+                                        if tool_name.ends_with(&suffix) && out.is_none() {
+                                            *tool_name = tool_name
+                                                .strip_suffix(&suffix)
+                                                .unwrap_or(tool_name)
+                                                .to_string();
+                                            *out = output.clone();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             _ => {}
         }
+    }
+
+    // Flush any remaining turn items
+    if !turn_items.is_empty() {
+        messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::Assistant,
+            timestamp: turn_timestamp.take(),
+            content: std::mem::take(&mut turn_items),
+            mode: current_mode.clone(),
+            is_agent: false,
+            is_meta: false,
+            duration_ms: None,
+        });
     }
 
     if session_id.is_empty() {
@@ -217,7 +370,8 @@ pub fn parse_codex_session(path: &Path) -> Result<Session, AppError> {
             .to_string();
     }
 
-    let title = title_from_first_user_message(&messages);
+    let title = title_from_first_user_message(&messages)
+        .or_else(|| title_from_session_index(&session_id));
 
     super::calculate_durations(&mut messages);
 
@@ -230,108 +384,61 @@ pub fn parse_codex_session(path: &Path) -> Result<Session, AppError> {
         started_at,
         messages,
         token_usage: usage_accumulator.into_token_usage(),
-        metadata: SessionMetadata {
-            working_directory: None,
-            git_branch: None,
-            slug: None,
-            repository: None,
-        },
+        metadata,
     })
 }
 
 fn extract_timestamp(record: &serde_json::Value) -> Option<String> {
     record
-        .get("created_at")
-        .or_else(|| record.get("timestamp"))
+        .get("timestamp")
         .and_then(|t| t.as_str())
         .map(String::from)
 }
 
-fn extract_message_text(record: &serde_json::Value) -> String {
-    // Try content array first, then content as string, then text field
-    if let Some(content) = record.get("content") {
-        if let Some(s) = content.as_str() {
-            return s.to_string();
-        }
-        if let Some(arr) = content.as_array() {
-            let texts: Vec<String> = arr
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .map(String::from)
-                .collect();
-            if !texts.is_empty() {
-                return texts.join("\n");
-            }
-        }
+fn parse_arguments(payload: &serde_json::Value) -> serde_json::Value {
+    let args = payload
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(s) = args.as_str() {
+        serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.to_string()))
+    } else {
+        args
     }
-    record
-        .get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string()
 }
 
-fn extract_user_content_blocks(record: &serde_json::Value) -> Vec<ContentBlock> {
-    let mut blocks = Vec::new();
-
-    if let Some(content) = record.get("content") {
-        if let Some(s) = content.as_str() {
-            blocks.push(ContentBlock::Text {
-                text: s.to_string(),
-            });
-        } else if let Some(arr) = content.as_array() {
-            // OpenAI format: [{"type":"text","text":"..."}, {"type":"image_url","image_url":{"url":"..."}}]
-            for part in arr {
-                let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                match part_type {
-                    "text" | "input_text" => {
-                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                            blocks.push(ContentBlock::Text {
-                                text: text.to_string(),
-                            });
-                        }
-                    }
-                    "image_url" => {
-                        if let Some(url) = part
-                            .get("image_url")
-                            .and_then(|i| i.get("url"))
-                            .and_then(|u| u.as_str())
-                        {
-                            blocks.push(ContentBlock::Image {
-                                source: url.to_string(),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
+fn title_from_first_user_message(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .and_then(|m| m.content.first())
+        .and_then(|c| match c {
+            ContentBlock::Text { text } if !text.trim().is_empty() => {
+                Some(text.chars().take(100).collect())
             }
-        }
-    }
-
-    if blocks.is_empty() {
-        let text = extract_message_text(record);
-        blocks.push(ContentBlock::Text { text });
-    }
-
-    blocks
+            _ => None,
+        })
 }
 
-fn extract_item_text(item: &serde_json::Value) -> Option<String> {
-    // Try content array
-    if let Some(arr) = item.get("content").and_then(|c| c.as_array()) {
-        let texts: Vec<String> = arr
-            .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .map(String::from)
-            .collect();
-        if !texts.is_empty() {
-            return Some(texts.join("\n"));
+fn title_from_session_index(session_id: &str) -> Option<String> {
+    let home = dirs::home_dir()?;
+    let index_path = home.join(".codex").join("session_index.jsonl");
+    let file = File::open(index_path).ok()?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if record.get("id").and_then(|id| id.as_str()) == Some(session_id) {
+            return record
+                .get("thread_name")
+                .and_then(|n| n.as_str())
+                .map(String::from);
         }
     }
-    // Try text field directly
-    item.get("text")
-        .and_then(|t| t.as_str())
-        .map(String::from)
+    None
 }
 
 struct UsageAccumulator {
@@ -384,31 +491,13 @@ impl UsageAccumulator {
     }
 }
 
-fn accumulate_turn_usage(record: &serde_json::Value, acc: &mut UsageAccumulator) {
-    if let Some(usage) = record.get("usage") {
-        acc.add(usage);
-    }
-}
-
-fn title_from_first_user_message(messages: &[Message]) -> Option<String> {
-    messages
-        .iter()
-        .find(|m| m.role == Role::User)
-        .and_then(|m| m.content.first())
-        .and_then(|c| match c {
-            ContentBlock::Text { text } if !text.trim().is_empty() => {
-                Some(text.chars().take(100).collect())
-            }
-            _ => None,
-        })
-}
-
 pub fn scan_codex_summary(
     path: &Path,
 ) -> Result<(Option<String>, Option<String>, Option<String>, usize), AppError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
+    let mut session_id = String::new();
     let mut title: Option<String> = None;
     let mut model: Option<String> = None;
     let mut started_at: Option<String> = None;
@@ -426,41 +515,60 @@ pub fn scan_codex_summary(
         };
 
         let event_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let payload = record.get("payload");
 
         match event_type {
-            "thread.started" => {
-                started_at = record
-                    .get("created_at")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
-            "message" => {
-                let role = record.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                if role == "user" {
-                    message_count += 1;
-                    if title.is_none() {
-                        let text = extract_message_text(&record);
-                        if !text.trim().is_empty() {
-                            title = Some(text.chars().take(100).collect());
-                        }
-                    }
+            "session_meta" => {
+                if let Some(p) = payload {
+                    session_id = p
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    started_at = p
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .or_else(|| extract_timestamp(&record));
                 }
             }
-            "turn.completed" => {
-                message_count += 1;
-            }
-            "item.completed" => {
+            "turn_context" => {
                 if model.is_none() {
-                    if let Some(item) = record.get("item") {
-                        model = item
+                    if let Some(p) = payload {
+                        model = p
                             .get("model")
                             .and_then(|m| m.as_str())
                             .map(String::from);
                     }
                 }
             }
+            "event_msg" => {
+                if let Some(p) = payload {
+                    let msg_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match msg_type {
+                        "user_message" => {
+                            message_count += 1;
+                            if title.is_none() {
+                                title = p
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .filter(|s| !s.trim().is_empty())
+                                    .map(|s| s.chars().take(100).collect());
+                            }
+                        }
+                        "task_complete" => {
+                            message_count += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    if title.is_none() {
+        title = title_from_session_index(&session_id);
     }
 
     Ok((title, model, started_at, message_count))
@@ -479,165 +587,131 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_basic_codex_session() {
-        let jsonl = r#"{"type":"thread.started","thread_id":"th_abc","session_id":"sess_1","created_at":"2026-03-20T10:00:00Z"}
-{"type":"message","role":"user","content":"Fix the login bug","created_at":"2026-03-20T10:00:01Z"}
-{"type":"turn.started","created_at":"2026-03-20T10:00:02Z"}
-{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"text","text":"I'll fix the login bug."}],"model":"o4-mini"}}
-{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50}}"#;
+    fn test_parse_basic_session() {
+        let jsonl = r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"abc-123","timestamp":"2026-03-20T10:00:00Z","cwd":"/home/user/project","originator":"Codex Desktop","cli_version":"0.115.0","source":"vscode","model_provider":"openai","git":{"branch":"main","repository_url":"https://github.com/user/project","commit_hash":"abc"}}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":200000,"collaboration_mode_kind":"plan"}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the login bug"}]}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.3-codex","turn_id":"turn-1","collaboration_mode":{"mode":"plan"},"cwd":"/home/user/project"}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the login bug","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-03-20T10:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[],"content":null,"encrypted_content":"encrypted..."}}
+{"timestamp":"2026-03-20T10:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"I'll look into the login module.","phase":"commentary"}}
+{"timestamp":"2026-03-20T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I'll look into the login module."}],"phase":"commentary"}}
+{"timestamp":"2026-03-20T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0},"last_token_usage":{"input_tokens":500,"cached_input_tokens":100,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":850},"model_context_window":200000},"rate_limits":null}}
+{"timestamp":"2026-03-20T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null}}"#;
 
         let file = write_jsonl(jsonl);
         let session = parse_codex_session(file.path()).unwrap();
 
-        assert_eq!(session.id, "th_abc");
+        assert_eq!(session.id, "abc-123");
         assert_eq!(session.source, SessionSource::Codex);
         assert_eq!(session.started_at, Some("2026-03-20T10:00:00Z".to_string()));
-        assert_eq!(session.title, Some("Fix the login bug".to_string()));
-        assert_eq!(session.model, Some("o4-mini".to_string()));
+        assert_eq!(session.model, Some("gpt-5.3-codex".to_string()));
+        assert_eq!(session.metadata.working_directory, Some("/home/user/project".to_string()));
+        assert_eq!(session.metadata.git_branch, Some("main".to_string()));
+
+        // Should have: 1 user message + 1 assistant message
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].role, Role::User);
         assert_eq!(session.messages[1].role, Role::Assistant);
+        assert_eq!(session.messages[0].mode, MessageMode::Plan);
 
+        // Title from user_message
+        assert_eq!(session.title, Some("Fix the login bug".to_string()));
+
+        // Token usage from token_count event
         let usage = session.token_usage.unwrap();
-        assert_eq!(usage.input_tokens, 100);
-        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.output_tokens, 200);
+        assert_eq!(usage.cache_read_tokens, Some(100));
     }
 
     #[test]
-    fn test_parse_tool_use_items() {
-        let jsonl = r#"{"type":"thread.started","thread_id":"th_tools","session_id":"sess_1","created_at":"2026-03-20T10:00:00Z"}
-{"type":"message","role":"user","content":"Read the config file","created_at":"2026-03-20T10:00:01Z"}
-{"type":"turn.started","created_at":"2026-03-20T10:00:02Z"}
-{"type":"item.completed","item":{"type":"command_execution","command":"cat config.json","output":"{ \"key\": \"value\" }"}}
-{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"text","text":"Here is the config."}],"model":"o4-mini"}}
-{"type":"turn.completed","usage":{"input_tokens":200,"output_tokens":100}}"#;
+    fn test_parse_function_calls() {
+        let jsonl = r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"fc-test","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp","originator":"Codex Desktop","cli_version":"0.115.0","source":"vscode","model_provider":"openai"}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":200000,"collaboration_mode_kind":"interactive"}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Read config.json","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-03-20T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"config.json\"}","call_id":"call_abc123"}}
+{"timestamp":"2026-03-20T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_abc123","output":"{ \"key\": \"value\" }"}}
+{"timestamp":"2026-03-20T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here is the config."}],"phase":"commentary"}}
+{"timestamp":"2026-03-20T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null}}"#;
 
         let file = write_jsonl(jsonl);
         let session = parse_codex_session(file.path()).unwrap();
 
         assert_eq!(session.messages.len(), 2); // user + assistant
         let assistant = &session.messages[1];
-        assert_eq!(assistant.content.len(), 2);
-        assert!(matches!(assistant.content[0], ContentBlock::ToolUse { .. }));
-        assert!(matches!(assistant.content[1], ContentBlock::Text { .. }));
-    }
-
-    #[test]
-    fn test_parse_file_change_item() {
-        let jsonl = r#"{"type":"thread.started","thread_id":"th_fc","session_id":"sess_1","created_at":"2026-03-20T10:00:00Z"}
-{"type":"turn.started","created_at":"2026-03-20T10:00:01Z"}
-{"type":"item.completed","item":{"type":"file_change","file":"src/main.rs","action":"modify","diff":"@@ -1,3 +1,4 @@\n+use std::io;\n"}}
-{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":25}}"#;
-
-        let file = write_jsonl(jsonl);
-        let session = parse_codex_session(file.path()).unwrap();
-
-        assert_eq!(session.messages.len(), 1);
+        assert_eq!(assistant.content.len(), 2); // tool_use + text
         if let ContentBlock::ToolUse {
             tool_name, output, input, ..
-        } = &session.messages[0].content[0]
+        } = &assistant.content[0]
         {
-            assert_eq!(tool_name, "file_change");
-            assert_eq!(input.get("file").unwrap().as_str().unwrap(), "src/main.rs");
-            assert!(output.is_some());
+            assert_eq!(tool_name, "read_file");
+            assert_eq!(input.get("path").unwrap().as_str().unwrap(), "config.json");
+            assert_eq!(output, &Some("{ \"key\": \"value\" }".to_string()));
         } else {
-            panic!("Expected ToolUse block for file_change");
+            panic!("Expected ToolUse block");
         }
-    }
-
-    #[test]
-    fn test_parse_reasoning_item() {
-        let jsonl = r#"{"type":"thread.started","thread_id":"th_reason","session_id":"sess_1","created_at":"2026-03-20T10:00:00Z"}
-{"type":"turn.started","created_at":"2026-03-20T10:00:01Z"}
-{"type":"item.completed","item":{"type":"reasoning","text":"Let me think about this..."}}
-{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"text","text":"Here is my answer."}],"model":"o4-mini"}}
-{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50}}"#;
-
-        let file = write_jsonl(jsonl);
-        let session = parse_codex_session(file.path()).unwrap();
-
-        assert_eq!(session.messages.len(), 1);
-        let assistant = &session.messages[0];
-        assert_eq!(assistant.content.len(), 2);
-        assert!(matches!(assistant.content[0], ContentBlock::Thinking { .. }));
         assert!(matches!(assistant.content[1], ContentBlock::Text { .. }));
     }
 
     #[test]
-    fn test_parse_error_event() {
-        let jsonl = r#"{"type":"thread.started","thread_id":"th_err","session_id":"sess_1","created_at":"2026-03-20T10:00:00Z"}
-{"type":"message","role":"user","content":"Do something","created_at":"2026-03-20T10:00:01Z"}
-{"type":"turn.started","created_at":"2026-03-20T10:00:02Z"}
-{"type":"turn.failed","message":"Rate limit exceeded","created_at":"2026-03-20T10:00:03Z"}"#;
+    fn test_parse_reasoning_summary() {
+        let jsonl = r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"reason-test","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp","originator":"Codex Desktop","cli_version":"0.115.0","source":"vscode","model_provider":"openai"}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":200000,"collaboration_mode_kind":"interactive"}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Explain this","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-03-20T10:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[{"text":"Analyzing the code structure"}],"content":null,"encrypted_content":"enc..."}}
+{"timestamp":"2026-03-20T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here is my analysis."}],"phase":"commentary"}}
+{"timestamp":"2026-03-20T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null}}"#;
 
         let file = write_jsonl(jsonl);
         let session = parse_codex_session(file.path()).unwrap();
 
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[1].role, Role::System);
-        if let ContentBlock::Text { text } = &session.messages[1].content[0] {
-            assert_eq!(text, "Rate limit exceeded");
-        }
-    }
-
-    #[test]
-    fn test_parse_mcp_tool_call() {
-        let jsonl = r#"{"type":"thread.started","thread_id":"th_mcp","session_id":"sess_1","created_at":"2026-03-20T10:00:00Z"}
-{"type":"turn.started","created_at":"2026-03-20T10:00:01Z"}
-{"type":"item.completed","item":{"type":"mcp_tool_call","name":"web_search","arguments":{"query":"rust error handling"},"result":"Found 10 results"}}
-{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50}}"#;
-
-        let file = write_jsonl(jsonl);
-        let session = parse_codex_session(file.path()).unwrap();
-
-        assert_eq!(session.messages.len(), 1);
-        if let ContentBlock::ToolUse {
-            tool_name, output, ..
-        } = &session.messages[0].content[0]
-        {
-            assert_eq!(tool_name, "web_search");
-            assert_eq!(output, &Some("Found 10 results".to_string()));
+        let assistant = &session.messages[1];
+        assert_eq!(assistant.content.len(), 2);
+        if let ContentBlock::Thinking { text } = &assistant.content[0] {
+            assert_eq!(text, "Analyzing the code structure");
         } else {
-            panic!("Expected ToolUse block for mcp_tool_call");
+            panic!("Expected Thinking block");
         }
     }
 
     #[test]
-    fn test_usage_accumulates_across_turns() {
-        let jsonl = r#"{"type":"thread.started","thread_id":"th_usage","session_id":"sess_1","created_at":"2026-03-20T10:00:00Z"}
-{"type":"message","role":"user","content":"First question","created_at":"2026-03-20T10:00:01Z"}
-{"type":"turn.started","created_at":"2026-03-20T10:00:02Z"}
-{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"text","text":"Answer 1"}],"model":"o4-mini"}}
-{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50,"cached_input_tokens":10}}
-{"type":"message","role":"user","content":"Follow up","created_at":"2026-03-20T10:00:10Z"}
-{"type":"turn.started","created_at":"2026-03-20T10:00:11Z"}
-{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"text","text":"Answer 2"}],"model":"o4-mini"}}
-{"type":"turn.completed","usage":{"input_tokens":200,"output_tokens":80,"cached_input_tokens":50}}"#;
+    fn test_multiple_turns_accumulate_usage() {
+        let jsonl = r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"usage-test","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp","originator":"Codex Desktop","cli_version":"0.115.0","source":"vscode","model_provider":"openai"}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":200000,"collaboration_mode_kind":"interactive"}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"First","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-03-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reply 1"}]}}
+{"timestamp":"2026-03-20T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":160}},"rate_limits":null}}
+{"timestamp":"2026-03-20T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null}}
+{"timestamp":"2026-03-20T10:01:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2","model_context_window":200000,"collaboration_mode_kind":"interactive"}}
+{"timestamp":"2026-03-20T10:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"Second","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-03-20T10:01:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reply 2"}]}}
+{"timestamp":"2026-03-20T10:01:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":80,"reasoning_output_tokens":0,"total_tokens":330}},"rate_limits":null}}
+{"timestamp":"2026-03-20T10:01:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","last_agent_message":null}}"#;
 
         let file = write_jsonl(jsonl);
         let session = parse_codex_session(file.path()).unwrap();
 
+        assert_eq!(session.messages.len(), 4); // 2 user + 2 assistant
         let usage = session.token_usage.unwrap();
         assert_eq!(usage.input_tokens, 300);
         assert_eq!(usage.output_tokens, 130);
         assert_eq!(usage.cache_read_tokens, Some(60));
-        assert!(usage.cache_write_tokens.is_none());
     }
 
     #[test]
-    fn test_scan_codex_summary() {
-        let jsonl = r#"{"type":"thread.started","thread_id":"th_scan","session_id":"sess_1","created_at":"2026-03-20T10:00:00Z"}
-{"type":"message","role":"user","content":"Build a REST API","created_at":"2026-03-20T10:00:01Z"}
-{"type":"turn.started","created_at":"2026-03-20T10:00:02Z"}
-{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"text","text":"Building..."}],"model":"o4-mini"}}
-{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50}}"#;
+    fn test_scan_summary() {
+        let jsonl = r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"scan-test","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp","originator":"Codex Desktop","cli_version":"0.115.0","source":"vscode","model_provider":"openai"}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.3-codex","turn_id":"turn-1","collaboration_mode":{"mode":"plan"},"cwd":"/tmp"}}
+{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Build a REST API","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-03-20T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null}}"#;
 
         let file = write_jsonl(jsonl);
         let (title, model, started_at, count) = scan_codex_summary(file.path()).unwrap();
 
         assert_eq!(title, Some("Build a REST API".to_string()));
-        assert_eq!(model, Some("o4-mini".to_string()));
+        assert_eq!(model, Some("gpt-5.3-codex".to_string()));
         assert_eq!(started_at, Some("2026-03-20T10:00:00Z".to_string()));
-        assert_eq!(count, 2); // 1 user message + 1 turn.completed
+        assert_eq!(count, 2); // 1 user_message + 1 task_complete
     }
 }

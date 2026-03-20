@@ -86,7 +86,7 @@ fn matches_codex_path(path: &Path) -> bool {
 
 fn is_codex_record(val: &serde_json::Value) -> bool {
     let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    event_type == "thread.started" && val.get("thread_id").is_some()
+    event_type == "session_meta" && val.get("payload").is_some()
 }
 
 #[cfg(test)]
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn test_detect_codex_from_content() {
-        let content = r#"{"type":"thread.started","thread_id":"th_abc123","session_id":"sess_1","created_at":"2026-03-20T10:00:00Z"}"#;
+        let content = r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"abc-123","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp","originator":"Codex Desktop","cli_version":"0.115.0","source":"vscode","model_provider":"openai"}}"#;
         assert_eq!(
             detect_format_from_content(content).unwrap(),
             SessionSource::Codex

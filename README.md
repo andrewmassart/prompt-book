@@ -1,11 +1,24 @@
 # Prompt Book
 
-A desktop app for viewing Claude Code and Copilot CLI session transcripts. Built with Tauri v2, React, and Rust.
+A desktop app for viewing Claude Code, Copilot CLI, and Codex CLI session transcripts. Built with Tauri v2, React, and Rust.
+
+## Install
+
+### macOS (Homebrew)
+
+```bash
+brew tap andrewmassart/tap
+brew install prompt-book
+```
+
+### Windows / Manual
+
+Download the latest installer from the [Releases](https://github.com/andrewmassart/prompt-book/releases) page.
 
 ## Features
 
-- Auto-discovers sessions from `~/.claude/projects/` and `~/.copilot/session-state/`
-- Parses Claude Code JSONL and Copilot CLI events.jsonl formats into a unified view
+- Auto-discovers sessions from `~/.claude/projects/`, `~/.copilot/session-state/`, and `~/.codex/sessions/`
+- Parses Claude Code, Copilot CLI, and Codex CLI JSONL formats into a unified view
 - Drag-and-drop or open arbitrary `.jsonl` files
 - Collapsible message bubbles, tool call blocks, and thinking blocks
 - Visual indicators for plan mode, auto/accept-edits mode, and sub-agent messages

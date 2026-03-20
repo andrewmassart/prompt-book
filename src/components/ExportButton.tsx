@@ -27,8 +27,9 @@ export function ExportButton({ session }: Readonly<ExportButtonProps>) {
 
   const handleExport = async () => {
     try {
+      const shortId = session.id.split("-")[0];
       const outputPath = await save({
-        defaultPath: `${session.title || "session"}.html`,
+        defaultPath: `prompt-book-${shortId}.html`,
         filters: [{ name: "HTML", extensions: ["html"] }],
       });
 

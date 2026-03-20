@@ -63,3 +63,17 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  update-tap:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger homebrew-tap update
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh workflow run update-cask.yml \
+            -f version="$VERSION" \
+            -R andrewmassart/homebrew-tap
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

@@ -7,35 +7,35 @@
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #1a1a2e; color: #e0e0e0; line-height: 1.6; padding: 20px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+    background: #161616; color: #d4d4d4; line-height: 1.6; padding: 20px;
   }
   .header {
     max-width: 900px; margin: 0 auto 24px; padding: 16px 20px;
-    background: #16213e; border-radius: 12px; border: 1px solid #0f3460;
+    background: #1e1e1e; border-radius: 12px; border: 1px solid #2e2e2e;
   }
-  .header h1 { font-size: 1.3em; color: #e94560; margin-bottom: 4px; }
-  .header .meta { font-size: 0.85em; color: #888; }
+  .header h1 { font-size: 1.3em; color: #6b9eff; margin-bottom: 4px; }
+  .header .meta { font-size: 0.85em; color: #999; }
   .messages { max-width: 900px; margin: 0 auto; }
   .message { margin-bottom: 12px; padding: 12px 16px; border-radius: 10px; }
-  .message.user { background: #0f3460; border-left: 3px solid #e94560; }
-  .message.assistant { background: #16213e; border-left: 3px solid #53a8b6; }
-  .message.system { background: #1a1a2e; border-left: 3px solid #555; font-size: 0.85em; color: #888; }
+  .message.user { background: #1e1e1e; border-left: 3px solid #e0a458; }
+  .message.assistant { background: #1e1e1e; border-left: 3px solid #6b9eff; }
+  .message.system { background: #161616; border-left: 3px solid #5a5a5a; font-size: 0.85em; color: #999; }
   .role-label { font-size: 0.75em; text-transform: uppercase; font-weight: 600; margin-bottom: 6px; letter-spacing: 0.05em; }
-  .role-label.user { color: #e94560; }
-  .role-label.assistant { color: #53a8b6; }
-  .role-label.system { color: #666; }
+  .role-label.user { color: #e0a458; }
+  .role-label.assistant { color: #6b9eff; }
+  .role-label.system { color: #5a5a5a; }
   .tool-block {
-    margin: 8px 0; padding: 10px; background: #0a0a1a; border-radius: 8px;
-    border: 1px solid #333; font-size: 0.9em;
+    margin: 8px 0; padding: 10px; background: #121212; border-radius: 8px;
+    border: 1px solid #2e2e2e; font-size: 0.9em;
   }
-  .tool-block summary { cursor: pointer; color: #b8860b; font-weight: 500; }
-  .tool-block pre { margin-top: 8px; white-space: pre-wrap; word-break: break-all; font-size: 0.85em; color: #aaa; }
+  .tool-block summary { cursor: pointer; color: #e0a458; font-weight: 500; }
+  .tool-block pre { margin-top: 8px; white-space: pre-wrap; word-break: break-all; font-size: 0.85em; color: #999; }
   .thinking-block {
-    margin: 8px 0; padding: 10px; background: #1a1a0a; border-radius: 8px;
-    border: 1px solid #444; font-size: 0.9em; font-style: italic; color: #999;
+    margin: 8px 0; padding: 10px; background: #1a1a1a; border-radius: 8px;
+    border: 1px solid #2e2e2e; font-size: 0.9em; font-style: italic; color: #6c6c6c;
   }
-  .thinking-block summary { cursor: pointer; color: #888; }
+  .thinking-block summary { cursor: pointer; color: #6c6c6c; }
   pre, code { font-family: 'Cascadia Code', 'Fira Code', monospace; }
   .text-content { white-space: pre-wrap; word-wrap: break-word; }
 </style>

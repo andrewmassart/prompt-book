@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub enum SessionSource {
     ClaudeCode,
     CopilotCli,
+    Codex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

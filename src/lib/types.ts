@@ -1,4 +1,4 @@
-export type SessionSource = "claude_code" | "copilot_cli";
+export type SessionSource = "claude_code" | "copilot_cli" | "codex";
 export type Role = "user" | "assistant" | "system" | "tool";
 export type MessageMode = "normal" | "plan" | "auto";
 

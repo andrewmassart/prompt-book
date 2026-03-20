@@ -4,6 +4,10 @@ use crate::error::AppError;
 use crate::model::SessionSource;
 
 pub fn detect_format(path: &Path) -> Result<SessionSource, AppError> {
+    if matches_codex_path(path) {
+        return Ok(SessionSource::Codex);
+    }
+
     if matches_claude_path(path) {
         return Ok(SessionSource::ClaudeCode);
     }
@@ -40,6 +44,10 @@ pub fn detect_format_from_content(content: &str) -> Result<SessionSource, AppErr
         return Ok(SessionSource::CopilotCli);
     }
 
+    if is_codex_record(&val) {
+        return Ok(SessionSource::Codex);
+    }
+
     Err(AppError::UnknownFormat(
         "Cannot detect format from content".to_string(),
     ))
@@ -70,6 +78,15 @@ fn is_copilot_record(val: &serde_json::Value) -> bool {
     let has_data = val.get("data").is_some();
     let has_id = val.get("id").is_some();
     event_type.starts_with("session.") && has_data && has_id
+}
+
+fn matches_codex_path(path: &Path) -> bool {
+    path.to_string_lossy().contains(".codex")
+}
+
+fn is_codex_record(val: &serde_json::Value) -> bool {
+    let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    event_type == "thread.started" && val.get("thread_id").is_some()
 }
 
 #[cfg(test)]
@@ -110,5 +127,20 @@ mod tests {
     fn test_detect_copilot_path() {
         let path = Path::new("/home/user/.copilot/session-state/s1/events.jsonl");
         assert_eq!(detect_format(path).unwrap(), SessionSource::CopilotCli);
+    }
+
+    #[test]
+    fn test_detect_codex_path() {
+        let path = Path::new("/home/user/.codex/sessions/2026/03/20/rollout-abc.jsonl");
+        assert_eq!(detect_format(path).unwrap(), SessionSource::Codex);
+    }
+
+    #[test]
+    fn test_detect_codex_from_content() {
+        let content = r#"{"type":"thread.started","thread_id":"th_abc123","session_id":"sess_1","created_at":"2026-03-20T10:00:00Z"}"#;
+        assert_eq!(
+            detect_format_from_content(content).unwrap(),
+            SessionSource::Codex
+        );
     }
 }

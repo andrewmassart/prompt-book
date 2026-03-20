@@ -5,6 +5,7 @@ use walkdir::WalkDir;
 use crate::error::AppError;
 use crate::model::{SessionSource, SessionSummary};
 use crate::parser::claude::scan_claude_summary;
+use crate::parser::codex::scan_codex_summary;
 use crate::parser::copilot::scan_copilot_summary;
 
 #[tauri::command]
@@ -15,6 +16,7 @@ pub async fn discover_sessions() -> Result<Vec<SessionSummary>, String> {
 fn discover_sessions_inner() -> Result<Vec<SessionSummary>, AppError> {
     let mut summaries = collect_claude_sessions();
     summaries.extend(collect_copilot_sessions());
+    summaries.extend(collect_codex_sessions());
     sort_newest_first(&mut summaries);
     Ok(summaries)
 }
@@ -51,6 +53,22 @@ fn collect_copilot_sessions() -> Vec<SessionSummary> {
         .collect()
 }
 
+fn collect_codex_sessions() -> Vec<SessionSummary> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+
+    let codex_dir = home.join(".codex").join("sessions");
+    if !codex_dir.exists() {
+        return Vec::new();
+    }
+
+    find_jsonl_files(&codex_dir)
+        .into_iter()
+        .filter_map(|path| build_codex_summary(path).ok())
+        .collect()
+}
+
 fn find_jsonl_files(dir: &std::path::Path) -> Vec<PathBuf> {
     WalkDir::new(dir)
         .follow_links(true)
@@ -81,6 +99,26 @@ fn build_claude_summary(path: PathBuf) -> Result<SessionSummary, AppError> {
     Ok(SessionSummary {
         id,
         source: SessionSource::ClaudeCode,
+        path,
+        title,
+        started_at,
+        message_count,
+        model,
+    })
+}
+
+fn build_codex_summary(path: PathBuf) -> Result<SessionSummary, AppError> {
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let (title, model, started_at, message_count) = scan_codex_summary(&path)?;
+
+    Ok(SessionSummary {
+        id,
+        source: SessionSource::Codex,
         path,
         title,
         started_at,

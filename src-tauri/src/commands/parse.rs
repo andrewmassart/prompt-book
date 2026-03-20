@@ -4,6 +4,7 @@ use crate::error::AppError;
 use crate::model::Session;
 use crate::model::SessionSource;
 use crate::parser::claude::parse_claude_session;
+use crate::parser::codex::parse_codex_session;
 use crate::parser::copilot::parse_copilot_session;
 use crate::parser::detect::{detect_format, detect_format_from_content};
 
@@ -29,6 +30,7 @@ fn parse_session_inner(path: &str) -> Result<Session, AppError> {
     match source {
         SessionSource::ClaudeCode => parse_claude_session(path),
         SessionSource::CopilotCli => parse_copilot_session(path),
+        SessionSource::Codex => parse_codex_session(path),
     }
 }
 
@@ -41,6 +43,7 @@ fn parse_content_inner(filename: &str, content: &str) -> Result<Session, AppErro
     let result = match source {
         SessionSource::ClaudeCode => parse_claude_session(&temp_path),
         SessionSource::CopilotCli => parse_copilot_session(&temp_path),
+        SessionSource::Codex => parse_codex_session(&temp_path),
     };
 
     std::fs::remove_file(&temp_path).ok();

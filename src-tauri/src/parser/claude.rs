@@ -242,7 +242,10 @@ impl UsageAccumulator {
     }
 
     fn add_from_record(&mut self, record: &serde_json::Value) {
-        let Some(usage) = record.get("usage") else {
+        let Some(usage) = record
+            .get("message")
+            .and_then(|m| m.get("usage"))
+        else {
             return;
         };
         self.has_data = true;

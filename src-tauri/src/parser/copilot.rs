@@ -240,16 +240,51 @@ fn parse_user_message(
     timestamp: Option<String>,
     mode: &MessageMode,
 ) -> Message {
-    let text = data
-        .and_then(|d| d.get("content").and_then(|c| c.as_str()))
-        .unwrap_or("")
-        .to_string();
+    let mut content = Vec::new();
+
+    if let Some(d) = data {
+        // Text content
+        if let Some(text) = d.get("content").and_then(|c| c.as_str()) {
+            if !text.is_empty() {
+                content.push(ContentBlock::Text {
+                    text: text.to_string(),
+                });
+            }
+        }
+
+        // Image attachments: {"attachments":[{"type":"image","mediaType":"image/png","data":"..."}]}
+        if let Some(attachments) = d.get("attachments").and_then(|a| a.as_array()) {
+            for att in attachments {
+                if att.get("type").and_then(|t| t.as_str()) == Some("image") {
+                    if let Some(data) = att.get("data").and_then(|d| d.as_str()) {
+                        let media_type = att
+                            .get("mediaType")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("image/png");
+                        content.push(ContentBlock::Image {
+                            source: format!("data:{};base64,{}", media_type, data),
+                        });
+                    } else if let Some(url) = att.get("url").and_then(|u| u.as_str()) {
+                        content.push(ContentBlock::Image {
+                            source: url.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if content.is_empty() {
+        content.push(ContentBlock::Text {
+            text: String::new(),
+        });
+    }
 
     Message {
         id: uuid::Uuid::new_v4().to_string(),
         role: Role::User,
         timestamp,
-        content: vec![ContentBlock::Text { text }],
+        content,
         mode: mode.clone(),
         is_agent: false,
         is_meta: false,

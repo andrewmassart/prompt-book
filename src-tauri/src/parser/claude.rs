@@ -286,10 +286,20 @@ fn extract_content_blocks(msg_content: &serde_json::Value) -> Vec<ContentBlock> 
         });
     } else if let Some(arr) = msg_content.as_array() {
         for block in arr {
-            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                content.push(ContentBlock::Text {
-                    text: text.to_string(),
-                });
+            let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match block_type {
+                "image" => {
+                    if let Some(cb) = parse_image_block(block) {
+                        content.push(cb);
+                    }
+                }
+                _ => {
+                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                        content.push(ContentBlock::Text {
+                            text: text.to_string(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -380,8 +390,41 @@ fn parse_assistant_content_block(block: &serde_json::Value) -> Option<ContentBlo
                 text: text.to_string(),
             })
         }
+        "image" => parse_image_block(block),
         _ => None,
     }
+}
+
+fn parse_image_block(block: &serde_json::Value) -> Option<ContentBlock> {
+    let source = block.get("source")?;
+
+    // Handle base64 encoded images: {"type":"base64","media_type":"image/png","data":"..."}
+    if source.get("type").and_then(|t| t.as_str()) == Some("base64") {
+        let media_type = source
+            .get("media_type")
+            .and_then(|m| m.as_str())
+            .unwrap_or("image/png");
+        let data = source.get("data").and_then(|d| d.as_str())?;
+        return Some(ContentBlock::Image {
+            source: format!("data:{};base64,{}", media_type, data),
+        });
+    }
+
+    // Handle URL images: {"type":"url","url":"https://..."}
+    if let Some(url) = source.get("url").and_then(|u| u.as_str()) {
+        return Some(ContentBlock::Image {
+            source: url.to_string(),
+        });
+    }
+
+    // Fallback: source might be a plain string
+    if let Some(s) = source.as_str() {
+        return Some(ContentBlock::Image {
+            source: s.to_string(),
+        });
+    }
+
+    None
 }
 
 fn extract_tool_result_output(record: &serde_json::Value) -> Option<String> {
@@ -687,5 +730,24 @@ mod tests {
 
         assert_eq!(session.messages[0].content.len(), 1);
         assert!(matches!(session.messages[0].content[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn test_user_message_with_image() {
+        let jsonl = r#"{"type":"user","message":{"content":[{"type":"text","text":"What is in this image?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}}]},"timestamp":"2025-01-01T00:00:01Z","sessionId":"img-test"}"#;
+
+        let file = create_test_jsonl(jsonl);
+        let path = copy_as_session(&file, "img-test");
+
+        let session = parse_claude_session(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(session.messages[0].content.len(), 2);
+        assert!(matches!(session.messages[0].content[0], ContentBlock::Text { .. }));
+        if let ContentBlock::Image { source } = &session.messages[0].content[1] {
+            assert_eq!(source, "data:image/png;base64,iVBOR");
+        } else {
+            panic!("Expected Image content block");
+        }
     }
 }

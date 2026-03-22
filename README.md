@@ -1,6 +1,12 @@
 # Prompt Book
 
-A desktop app for viewing Claude Code, Copilot CLI, and Codex CLI session transcripts. Built with Tauri v2, React, and Rust.
+A native desktop viewer for your AI coding sessions. Prompt Book reads session transcripts from Claude Code, GitHub Copilot CLI, and OpenAI Codex CLI and renders them in a unified, browsable interface with collapsible tool calls, thinking blocks, token usage stats, and one-click HTML export.
+
+Built with Tauri v2, React 19, and Rust.
+
+<!-- TODO: Add screenshot
+![Prompt Book screenshot](docs/screenshot.png)
+-->
 
 ## Install
 
@@ -11,26 +17,50 @@ brew tap andrewmassart/tap
 brew install prompt-book
 ```
 
-### Windows / Manual
+### Windows
 
-Download the latest installer from the [Releases](https://github.com/andrewmassart/prompt-book/releases) page.
+Download the `.exe` installer from the [latest release](https://github.com/andrewmassart/prompt-book/releases/latest).
+
+## What it does
+
+Prompt Book auto-discovers JSONL session files from:
+
+| Platform | Location |
+|---|---|
+| Claude Code | `~/.claude/projects/` |
+| GitHub Copilot CLI | `~/.copilot/session-state/` |
+| OpenAI Codex CLI | `~/.codex/sessions/` |
+
+Each session is parsed into a unified conversation view showing messages, tool calls, thinking blocks, code blocks, and images. You can also drag-and-drop or open any `.jsonl` file directly.
 
 ## Features
 
-- Auto-discovers sessions from `~/.claude/projects/`, `~/.copilot/session-state/`, and `~/.codex/sessions/`
-- Parses Claude Code, Copilot CLI, and Codex CLI JSONL formats into a unified view
-- Drag-and-drop or open arbitrary `.jsonl` files
-- Collapsible message bubbles, tool call blocks, and thinking blocks
-- Visual indicators for plan mode, auto/accept-edits mode, and sub-agent messages
-- Export sessions as self-contained HTML files
-- In-memory session caching for instant navigation
+- **Multi-platform parsing** — Claude Code, Copilot CLI, and Codex CLI sessions in one place
+- **Rich content rendering** — tool calls with inputs/outputs, thinking blocks, code blocks with language labels, and inline images
+- **Collapsible everything** — long messages, tool calls, and thinking blocks auto-collapse with expand/collapse controls
+- **Session metadata** — model name, timestamps, message count, token usage (including cache read/write), git branch, and working directory
+- **Mode indicators** — visual badges for plan mode, auto-accept mode, and sub-agent messages
+- **HTML export** — save any session as a self-contained HTML file for sharing or archiving
+- **Drag-and-drop** — drop `.jsonl` files onto the window to view them instantly
+- **In-memory caching** — switch between sessions without re-parsing
 
-## Prerequisites
+## Tech stack
 
-- [Node.js](https://nodejs.org/) (v18+)
+| Layer | Technology |
+|---|---|
+| Desktop shell | Tauri 2 |
+| Frontend | React 19 + React Compiler |
+| Backend / parsing | Rust (serde, walkdir, chrono) |
+| Build | Vite 7 |
+
+## Development
+
+### Prerequisites
+
+- [Node.js](https://nodejs.org/) v18+
 - [Rust](https://rustup.rs/)
 
-## Getting Started
+### Run locally
 
 ```bash
 git clone https://github.com/andrewmassart/prompt-book.git
@@ -39,10 +69,14 @@ npm install
 npm run tauri dev
 ```
 
-## Build
+### Build
 
 ```bash
 npm run tauri build
 ```
 
 Produces platform-specific installers in `src-tauri/target/release/bundle/`.
+
+## License
+
+MIT

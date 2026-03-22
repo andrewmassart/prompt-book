@@ -10,7 +10,9 @@ export function formatDuration(ms: number): string {
 export function formatTime(iso?: string): string {
   if (!iso) return "";
   try {
-    return new Date(iso).toLocaleTimeString(undefined, {
+    return new Date(iso).toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",

@@ -3,276 +3,201 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use super::records::{
+    CopilotAssistantData, CopilotRecord, CopilotShutdownData, CopilotToolCompleteData,
+    CopilotUserMessageData,
+};
+use super::{truncate_to_chars, ParseEvent, ParseState, UsageAccumulator};
 use crate::error::AppError;
 use crate::model::{
     ContentBlock, Message, MessageMode, Role, Session, SessionMetadata, SessionSource, TokenUsage,
 };
 
 pub fn parse_copilot_session(path: &Path) -> Result<Session, AppError> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    let mut session_id = String::new();
-    let mut started_at: Option<String> = None;
-    let mut model: Option<String> = None;
-    let mut messages: Vec<Message> = Vec::new();
-    let mut metadata = SessionMetadata {
-        working_directory: None,
-        git_branch: None,
-        slug: None,
-        repository: None,
-    };
-    let mut token_usage: Option<TokenUsage> = None;
-    let mut current_mode = MessageMode::Normal;
-    let mut tool_starts: HashMap<String, ToolStartInfo> = HashMap::new();
     let mut active_agents: HashMap<String, String> = HashMap::new();
 
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+    let session_id = super::session_id_from_path(path);
+    let mut session = super::parse_jsonl_session(
+        path,
+        SessionSource::CopilotCli,
+        session_id,
+        |line, state| {
+            let Ok(record) = serde_json::from_str::<CopilotRecord>(line) else { return };
+            process_copilot_record(&record, state, &mut active_agents);
+        },
+    )?;
 
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-
-        let event_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let data = record.get("data");
-        let timestamp = extract_timestamp(&record);
-
-        match event_type {
-            "session.start" => {
-                parse_session_start(data, &mut session_id, &mut started_at, &mut metadata);
-            }
-            "session.mode_changed" => {
-                current_mode = parse_mode_change(data);
-            }
-            "session.shutdown" => {
-                token_usage = parse_shutdown_usage(data);
-                if model.is_none() {
-                    model = extract_current_model(data);
-                }
-            }
-            "session.warning" | "session.error" => {
-                let msg = parse_session_event(data, timestamp, &current_mode);
-                messages.push(msg);
-            }
-            "user.message" => {
-                let msg = parse_user_message(data, timestamp, &current_mode);
-                messages.push(msg);
-            }
-            "assistant.message" => {
-                let (msg, tool_requests) =
-                    parse_assistant_message(data, timestamp, &current_mode, &active_agents);
-                if model.is_none() {
-                    model = extract_message_model(data);
-                }
-                messages.push(msg);
-                for (call_id, tool_name, _input) in tool_requests {
-                    tool_starts.insert(call_id, ToolStartInfo { tool_name });
-                }
-            }
-            "tool.execution_complete" => {
-                attach_tool_completion(data, &tool_starts, &mut messages);
-            }
-            "subagent.started" => {
-                if let Some(d) = data {
-                    let call_id = str_field(d, "toolCallId");
-                    let name = str_field(d, "agentDisplayName");
-                    if !call_id.is_empty() {
-                        active_agents.insert(call_id, name);
-                    }
-                }
-            }
-            "subagent.completed" => {
-                if let Some(d) = data {
-                    let call_id = str_field(d, "toolCallId");
-                    active_agents.remove(&call_id);
-                }
-            }
-            _ => {}
-        }
+    if session.id.is_empty() {
+        session.id = super::session_id_from_path(path);
     }
 
-    if session_id.is_empty() {
-        session_id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+    Ok(session)
+}
+
+pub fn parse_copilot_content(filename: &str, content: &str) -> Result<Session, AppError> {
+    let mut active_agents: HashMap<String, String> = HashMap::new();
+    let path = std::path::Path::new(filename);
+    let session_id = super::session_id_from_path(path);
+
+    super::parse_jsonl_from_content(
+        content,
+        SessionSource::CopilotCli,
+        session_id,
+        path,
+        |line, state| {
+            let Ok(record) = serde_json::from_str::<CopilotRecord>(line) else { return };
+            process_copilot_record(&record, state, &mut active_agents);
+        },
+    )
+}
+
+fn process_copilot_record(
+    record: &CopilotRecord,
+    state: &mut ParseState,
+    active_agents: &mut HashMap<String, String>,
+) {
+    let timestamp = record.timestamp().map(String::from);
+
+    match record {
+        CopilotRecord::SessionStart { data: Some(d), .. } => {
+            if let Some(sid) = &d.session_id {
+                state.apply(ParseEvent::SetSessionId(sid.clone()));
+            }
+            if let Some(ts) = &d.start_time {
+                state.apply(ParseEvent::SetStartedAt(ts.clone()));
+            }
+            if let Some(ctx) = &d.context {
+                state.apply(ParseEvent::SetMetadata(SessionMetadata {
+                    working_directory: ctx.cwd.clone(),
+                    git_branch: ctx.branch.clone(),
+                    repository: ctx.repository.clone(),
+                    ..SessionMetadata::default()
+                }));
+            }
+        }
+
+        CopilotRecord::ModeChanged { data, .. } => {
+            let mode = data
+                .as_ref()
+                .and_then(|d| d.new_mode.as_deref())
+                .map(super::parse_mode)
+                .unwrap_or(MessageMode::Normal);
+            state.apply(ParseEvent::SetMode(mode));
+        }
+
+        CopilotRecord::SessionShutdown { data: Some(d), .. } => {
+            if let Some(tu) = parse_shutdown_usage(d) {
+                state.apply(ParseEvent::SetTokenUsage(Some(tu)));
+            }
+            if let Some(m) = &d.current_model {
+                state.apply(ParseEvent::SetModel(m.clone()));
+            }
+        }
+
+        CopilotRecord::SessionWarning { data, .. }
+        | CopilotRecord::SessionError { data, .. } => {
+            let text = data
+                .as_ref()
+                .and_then(|d| d.message.clone())
+                .unwrap_or_default();
+            state.apply(ParseEvent::AddMessage(Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::System,
+                timestamp,
+                content: vec![ContentBlock::Text { text }],
+                mode: state.current_mode,
+                is_agent: false,
+                is_meta: false,
+                duration_ms: None,
+            }));
+        }
+
+        CopilotRecord::UserMessage { data, .. } => {
+            state.apply(ParseEvent::AddMessage(
+                build_user_message(data.as_ref(), timestamp, state.current_mode),
+            ));
+        }
+
+        CopilotRecord::AssistantMessage { data, .. } => {
+            let msg = build_assistant_message(data.as_ref(), timestamp, state.current_mode, active_agents);
+            state.apply(ParseEvent::AddMessage(msg));
+        }
+
+        CopilotRecord::ToolComplete { data: Some(d), .. } => {
+            match d.tool_call_id.as_deref() {
+                Some(id) if !id.is_empty() => {
+                    state.apply(ParseEvent::AttachToolOutputById {
+                        tool_call_id: id.to_string(),
+                        output: extract_tool_completion_output(d),
+                        duration_ms: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        CopilotRecord::SubagentStarted { data: Some(d), .. } => {
+            if let Some(call_id) = d.tool_call_id.as_deref().filter(|id| !id.is_empty()) {
+                let name = d.agent_display_name.clone().unwrap_or_default();
+                active_agents.insert(call_id.to_owned(), name);
+            }
+        }
+
+        CopilotRecord::SubagentCompleted { data: Some(d), .. } => {
+            if let Some(call_id) = &d.tool_call_id {
+                active_agents.remove(call_id);
+            }
+        }
+
+        CopilotRecord::SessionStart { data: None, .. }
+        | CopilotRecord::SessionShutdown { data: None, .. }
+        | CopilotRecord::ToolComplete { data: None, .. }
+        | CopilotRecord::SubagentStarted { data: None, .. }
+        | CopilotRecord::SubagentCompleted { data: None, .. }
+        | CopilotRecord::Unknown => {}
     }
-
-    let title = title_from_first_user_message(&messages);
-    super::calculate_durations(&mut messages);
-
-    Ok(Session {
-        id: session_id,
-        source: SessionSource::CopilotCli,
-        source_path: path.to_path_buf(),
-        title,
-        model,
-        started_at,
-        messages,
-        token_usage,
-        metadata,
-    })
 }
 
-struct ToolStartInfo {
-    tool_name: String,
+fn parse_shutdown_usage(data: &CopilotShutdownData) -> Option<TokenUsage> {
+    let metrics = data.model_metrics.as_ref()?;
+    let acc = metrics
+        .values()
+        .filter_map(|m| m.get("usage"))
+        .fold(UsageAccumulator::default(), |acc, usage| acc.merge(usage));
+    acc.into_token_usage()
 }
 
-fn str_field(val: &serde_json::Value, key: &str) -> String {
-    val.get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn extract_timestamp(record: &serde_json::Value) -> Option<String> {
-    record
-        .get("timestamp")
-        .and_then(|t| t.as_str())
+fn extract_tool_completion_output(d: &CopilotToolCompleteData) -> Option<String> {
+    d.result
+        .as_ref()
+        .and_then(|r| r.detailed_content.as_deref().or(r.content.as_deref()))
+        .or_else(|| d.error.as_ref().and_then(|e| e.message.as_deref()))
         .map(String::from)
 }
 
-fn parse_session_start(
-    data: Option<&serde_json::Value>,
-    session_id: &mut String,
-    started_at: &mut Option<String>,
-    metadata: &mut SessionMetadata,
-) {
-    let Some(d) = data else { return };
-    *session_id = str_field(d, "sessionId");
-    *started_at = d.get("startTime").and_then(|t| t.as_str()).map(String::from);
+fn build_user_message(
+    data: Option<&CopilotUserMessageData>,
+    timestamp: Option<String>,
+    mode: MessageMode,
+) -> Message {
+    let mut content: Vec<ContentBlock> = match data {
+        Some(d) => {
+            let mut blocks: Vec<ContentBlock> = d
+                .content
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .into_iter()
+                .map(|text| ContentBlock::Text { text: text.to_owned() })
+                .collect();
 
-    if let Some(ctx) = d.get("context") {
-        metadata.working_directory = ctx.get("cwd").and_then(|v| v.as_str()).map(String::from);
-        metadata.git_branch = ctx.get("branch").and_then(|v| v.as_str()).map(String::from);
-        metadata.repository = ctx
-            .get("repository")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-    }
-}
+            if let Some(attachments) = &d.attachments {
+                blocks.extend(attachments.iter().filter_map(attachment_to_image));
+            }
 
-fn parse_mode_change(data: Option<&serde_json::Value>) -> MessageMode {
-    let Some(d) = data else {
-        return MessageMode::Normal;
+            blocks
+        }
+        None => Vec::new(),
     };
-    match d.get("newMode").and_then(|m| m.as_str()) {
-        Some("plan") => MessageMode::Plan,
-        Some("autopilot") => MessageMode::Auto,
-        _ => MessageMode::Normal,
-    }
-}
-
-fn parse_shutdown_usage(data: Option<&serde_json::Value>) -> Option<TokenUsage> {
-    let d = data?;
-    let metrics = d.get("modelMetrics")?.as_object()?;
-
-    let mut input_tokens: u64 = 0;
-    let mut output_tokens: u64 = 0;
-    let mut cache_read: u64 = 0;
-    let mut cache_write: u64 = 0;
-
-    for (_model, m) in metrics {
-        if let Some(usage) = m.get("usage") {
-            input_tokens += usage.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            output_tokens += usage.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            cache_read += usage
-                .get("cacheReadTokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            cache_write += usage
-                .get("cacheWriteTokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-        }
-    }
-
-    Some(TokenUsage {
-        input_tokens,
-        output_tokens,
-        cache_read_tokens: if cache_read > 0 { Some(cache_read) } else { None },
-        cache_write_tokens: if cache_write > 0 {
-            Some(cache_write)
-        } else {
-            None
-        },
-    })
-}
-
-fn extract_current_model(data: Option<&serde_json::Value>) -> Option<String> {
-    data?.get("currentModel")?.as_str().map(String::from)
-}
-
-fn extract_message_model(_data: Option<&serde_json::Value>) -> Option<String> {
-    None
-}
-
-fn parse_session_event(
-    data: Option<&serde_json::Value>,
-    timestamp: Option<String>,
-    mode: &MessageMode,
-) -> Message {
-    let text = data
-        .and_then(|d| d.get("message").and_then(|m| m.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    Message {
-        id: uuid::Uuid::new_v4().to_string(),
-        role: Role::System,
-        timestamp,
-        content: vec![ContentBlock::Text { text }],
-        mode: mode.clone(),
-        is_agent: false,
-        is_meta: false,
-        duration_ms: None,
-    }
-}
-
-fn parse_user_message(
-    data: Option<&serde_json::Value>,
-    timestamp: Option<String>,
-    mode: &MessageMode,
-) -> Message {
-    let mut content = Vec::new();
-
-    if let Some(d) = data {
-        // Text content
-        if let Some(text) = d.get("content").and_then(|c| c.as_str()) {
-            if !text.is_empty() {
-                content.push(ContentBlock::Text {
-                    text: text.to_string(),
-                });
-            }
-        }
-
-        // Image attachments: {"attachments":[{"type":"image","mediaType":"image/png","data":"..."}]}
-        if let Some(attachments) = d.get("attachments").and_then(|a| a.as_array()) {
-            for att in attachments {
-                if att.get("type").and_then(|t| t.as_str()) == Some("image") {
-                    if let Some(data) = att.get("data").and_then(|d| d.as_str()) {
-                        let media_type = att
-                            .get("mediaType")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("image/png");
-                        content.push(ContentBlock::Image {
-                            source: format!("data:{};base64,{}", media_type, data),
-                        });
-                    } else if let Some(url) = att.get("url").and_then(|u| u.as_str()) {
-                        content.push(ContentBlock::Image {
-                            source: url.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-    }
 
     if content.is_empty() {
         content.push(ContentBlock::Text {
@@ -285,165 +210,104 @@ fn parse_user_message(
         role: Role::User,
         timestamp,
         content,
-        mode: mode.clone(),
+        mode,
         is_agent: false,
         is_meta: false,
         duration_ms: None,
     }
 }
 
-fn parse_assistant_message(
-    data: Option<&serde_json::Value>,
+fn attachment_to_image(
+    att: &super::records::CopilotAttachment,
+) -> Option<ContentBlock> {
+    if att.kind.as_deref() != Some("image") {
+        return None;
+    }
+    match (&att.data, &att.url) {
+        (Some(data_str), _) => {
+            let media_type = att.media_type.as_deref().unwrap_or("image/png");
+            Some(ContentBlock::Image {
+                source: format!("data:{media_type};base64,{data_str}"),
+            })
+        }
+        (None, Some(url)) => Some(ContentBlock::Image {
+            source: url.clone(),
+        }),
+        (None, None) => None,
+    }
+}
+
+fn build_assistant_message(
+    data: Option<&CopilotAssistantData>,
     timestamp: Option<String>,
-    mode: &MessageMode,
+    mode: MessageMode,
     active_agents: &HashMap<String, String>,
-) -> (Message, Vec<(String, String, serde_json::Value)>) {
+) -> Message {
     let Some(d) = data else {
-        return (
-            Message {
-                id: uuid::Uuid::new_v4().to_string(),
-                role: Role::Assistant,
-                timestamp,
-                content: Vec::new(),
-                mode: mode.clone(),
-                is_agent: false,
-                is_meta: false,
-                duration_ms: None,
-            },
-            Vec::new(),
-        );
+        return Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::Assistant,
+            timestamp,
+            content: Vec::new(),
+            mode,
+            is_agent: false,
+            is_meta: false,
+            duration_ms: None,
+        };
     };
 
-    let mut content = Vec::new();
-    let mut tool_requests = Vec::new();
+    let mut content: Vec<ContentBlock> = Vec::new();
 
-    let text = d
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-    if !text.is_empty() {
+    if let Some(text) = d.content.as_deref().filter(|t| !t.is_empty()) {
         content.push(ContentBlock::Text {
-            text: text.to_string(),
+            text: text.to_owned(),
         });
     }
 
-    if let Some(reasoning) = d.get("reasoningText").and_then(|r| r.as_str()) {
-        if !reasoning.is_empty() {
-            content.push(ContentBlock::Thinking {
-                text: reasoning.to_string(),
-            });
-        }
+    if let Some(reasoning) = d.reasoning_text.as_deref().filter(|r| !r.is_empty()) {
+        content.push(ContentBlock::Thinking {
+            text: reasoning.to_owned(),
+        });
     }
 
-    if let Some(requests) = d.get("toolRequests").and_then(|t| t.as_array()) {
-        for req in requests {
-            let call_id = str_field(req, "toolCallId");
-            let tool_name = str_field(req, "name");
-            let input = parse_tool_arguments(req);
-
-            content.push(ContentBlock::ToolUse {
-                tool_name: tool_name.clone(),
-                input: input.clone(),
+    content.extend(
+        d.tool_requests
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|req| ContentBlock::ToolUse {
+                tool_name: req.name.clone().unwrap_or_default(),
+                tool_call_id: req.tool_call_id.clone(),
+                input: req.arguments.as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(serde_json::Value::Null),
                 output: None,
                 duration_ms: None,
-            });
-
-            tool_requests.push((call_id, tool_name, input));
-        }
-    }
+            }),
+    );
 
     let is_agent = d
-        .get("parentToolCallId")
-        .and_then(|id| id.as_str())
-        .map(|id| active_agents.contains_key(id))
-        .unwrap_or(false);
+        .parent_tool_call_id
+        .as_deref()
+        .is_some_and(|id| active_agents.contains_key(id));
 
-    let msg = Message {
+    Message {
         id: d
-            .get("messageId")
-            .and_then(|m| m.as_str())
-            .map(String::from)
+            .message_id
+            .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         role: Role::Assistant,
         timestamp,
         content,
-        mode: mode.clone(),
+        mode,
         is_agent,
         is_meta: false,
         duration_ms: None,
-    };
-
-    (msg, tool_requests)
-}
-
-fn parse_tool_arguments(req: &serde_json::Value) -> serde_json::Value {
-    let args = req.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
-    if let Some(s) = args.as_str() {
-        serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.to_string()))
-    } else {
-        args
     }
 }
 
-fn attach_tool_completion(
-    data: Option<&serde_json::Value>,
-    tool_starts: &HashMap<String, ToolStartInfo>,
-    messages: &mut [Message],
-) {
-    let Some(d) = data else { return };
-    let call_id = str_field(d, "toolCallId");
-    if call_id.is_empty() {
-        return;
-    }
-
-    let output = d
-        .get("result")
-        .and_then(|r| {
-            r.get("detailedContent")
-                .or_else(|| r.get("content"))
-                .and_then(|c| c.as_str())
-        })
-        .or_else(|| {
-            d.get("error")
-                .and_then(|e| e.get("message").and_then(|m| m.as_str()))
-        })
-        .map(String::from);
-
-    let Some(start_info) = tool_starts.get(&call_id) else {
-        return;
-    };
-
-    for msg in messages.iter_mut().rev() {
-        for block in msg.content.iter_mut() {
-            if let ContentBlock::ToolUse {
-                tool_name,
-                output: ref mut out,
-                ..
-            } = block
-            {
-                if *tool_name == start_info.tool_name && out.is_none() {
-                    *out = output;
-                    return;
-                }
-            }
-        }
-    }
-}
-
-fn title_from_first_user_message(messages: &[Message]) -> Option<String> {
-    messages
-        .iter()
-        .find(|m| m.role == Role::User)
-        .and_then(|m| m.content.first())
-        .and_then(|c| match c {
-            ContentBlock::Text { text } => Some(text.chars().take(100).collect()),
-            _ => None,
-        })
-}
-
-pub fn scan_copilot_summary(
-    path: &Path,
-) -> Result<(Option<String>, Option<String>, Option<String>, usize), AppError> {
+/// Quickly scans a Copilot CLI session file for summary metadata without full parsing.
+pub fn scan_copilot_summary(path: &Path) -> super::ScanSummary {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
@@ -463,30 +327,28 @@ pub fn scan_copilot_summary(
             continue;
         };
 
-        let event_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-        match event_type {
+        match record.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "session.start" => {
-                if let Some(d) = record.get("data") {
-                    started_at = d.get("startTime").and_then(|t| t.as_str()).map(String::from);
-                }
+                started_at = record
+                    .get("data")
+                    .and_then(|d| d.get("startTime"))
+                    .and_then(|t| t.as_str())
+                    .map(String::from);
             }
             "session.shutdown" => {
-                if let Some(d) = record.get("data") {
-                    if model.is_none() {
-                        model = d.get("currentModel").and_then(|m| m.as_str()).map(String::from);
-                    }
-                }
+                model = model.or_else(|| {
+                    record.get("data")?.get("currentModel")?.as_str().map(String::from)
+                });
             }
             "user.message" => {
                 message_count += 1;
-                if title.is_none() {
-                    title = record
-                        .get("data")
-                        .and_then(|d| d.get("content"))
-                        .and_then(|c| c.as_str())
-                        .map(|s| s.chars().take(100).collect());
-                }
+                title = title.or_else(|| {
+                    record
+                        .get("data")?
+                        .get("content")?
+                        .as_str()
+                        .map(|s| truncate_to_chars(s, 100))
+                });
             }
             "assistant.message" => {
                 message_count += 1;

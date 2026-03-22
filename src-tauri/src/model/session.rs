@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// The origin platform of a parsed session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionSource {
     ClaudeCode,
@@ -9,7 +10,8 @@ pub enum SessionSource {
     Codex,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+/// The permission/interaction mode active during a message.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageMode {
     #[default]
@@ -18,6 +20,7 @@ pub enum MessageMode {
     Auto,
 }
 
+/// A complete parsed conversation session with messages and metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
@@ -32,6 +35,7 @@ pub struct Session {
     pub metadata: SessionMetadata,
 }
 
+/// A single message within a session conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -49,7 +53,8 @@ pub struct Message {
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// The role of a message sender.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
@@ -58,6 +63,7 @@ pub enum Role {
     Tool,
 }
 
+/// A typed content block within a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -67,6 +73,8 @@ pub enum ContentBlock {
     ToolUse {
         #[serde(rename = "toolName")]
         tool_name: String,
+        #[serde(rename = "toolCallId", default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
         input: serde_json::Value,
         output: Option<String>,
         #[serde(rename = "durationMs")]
@@ -84,6 +92,7 @@ pub enum ContentBlock {
     },
 }
 
+/// Aggregated token usage statistics for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
@@ -93,7 +102,8 @@ pub struct TokenUsage {
     pub cache_write_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Project metadata extracted from session context.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMetadata {
     pub working_directory: Option<String>,
@@ -102,6 +112,7 @@ pub struct SessionMetadata {
     pub repository: Option<String>,
 }
 
+/// Lightweight session info for sidebar listing without full message parsing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {

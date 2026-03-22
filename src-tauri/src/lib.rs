@@ -5,9 +5,10 @@ mod parser;
 
 use commands::discover::discover_sessions;
 use commands::export::export_html;
-use commands::parse::{parse_content, parse_dropped_file, parse_session};
+use commands::session::{parse_content, parse_dropped_file, parse_session};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Starts the Tauri application with configured plugins and command handlers.
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -21,5 +22,5 @@ pub fn run() {
             export_html,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|e| eprintln!("Application error: {e}"));
 }

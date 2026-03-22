@@ -3,90 +3,58 @@ use std::path::Path;
 use crate::error::AppError;
 use crate::model::SessionSource;
 
+/// Detects the session format from file path and content.
 pub fn detect_format(path: &Path) -> Result<SessionSource, AppError> {
-    if matches_codex_path(path) {
-        return Ok(SessionSource::Codex);
+    if let Some(source) = detect_from_path_components(path) {
+        return Ok(source);
     }
-
-    if matches_claude_path(path) {
-        return Ok(SessionSource::ClaudeCode);
+    match path.extension() {
+        Some(ext) if ext == "jsonl" => {
+            let content = std::fs::read_to_string(path)?;
+            detect_format_from_content(&content)
+        }
+        _ => Err(AppError::UnknownFormat(format!("Cannot detect format for: {}", path.display()))),
     }
-
-    if matches_copilot_path(path) {
-        return Ok(SessionSource::CopilotCli);
-    }
-
-    if is_jsonl(path) {
-        let content = std::fs::read_to_string(path).map_err(AppError::Io)?;
-        return detect_format_from_content(&content);
-    }
-
-    Err(AppError::UnknownFormat(format!(
-        "Cannot detect format for: {}",
-        path.display()
-    )))
 }
 
+fn detect_from_path_components(path: &Path) -> Option<SessionSource> {
+    path.ancestors()
+        .filter_map(|p| p.file_name())
+        .find_map(|name| match name.to_str()? {
+            ".codex" | "codex" => Some(SessionSource::Codex),
+            ".claude" => Some(SessionSource::ClaudeCode),
+            ".copilot" | "copilot" => Some(SessionSource::CopilotCli),
+            _ => None,
+        })
+}
+
+/// Detects the session format by inspecting the first line of JSONL content.
 pub fn detect_format_from_content(content: &str) -> Result<SessionSource, AppError> {
     let first_line = content.lines().next().unwrap_or("");
+    let val = serde_json::from_str::<serde_json::Value>(first_line)
+        .map_err(|_| AppError::UnknownFormat("Cannot parse first line as JSON".to_string()))?;
 
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(first_line) else {
-        return Err(AppError::UnknownFormat(
-            "Cannot parse first line as JSON".to_string(),
-        ));
-    };
+    let record_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-    if is_claude_record(&val) {
-        return Ok(SessionSource::ClaudeCode);
+    match () {
+        _ if is_claude_record(record_type, &val) => Ok(SessionSource::ClaudeCode),
+        _ if is_copilot_record(record_type, &val) => Ok(SessionSource::CopilotCli),
+        _ if is_codex_record(record_type, &val) => Ok(SessionSource::Codex),
+        _ => Err(AppError::UnknownFormat("Cannot detect format from content".to_string())),
     }
-
-    if is_copilot_record(&val) {
-        return Ok(SessionSource::CopilotCli);
-    }
-
-    if is_codex_record(&val) {
-        return Ok(SessionSource::Codex);
-    }
-
-    Err(AppError::UnknownFormat(
-        "Cannot detect format from content".to_string(),
-    ))
 }
 
-fn matches_claude_path(path: &Path) -> bool {
-    path.to_string_lossy().contains(".claude")
+fn is_claude_record(record_type: &str, val: &serde_json::Value) -> bool {
+    val.get("sessionId").is_some()
+        && (val.get("message").is_some() || record_type == "summary")
 }
 
-fn matches_copilot_path(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-    path_str.contains(".copilot") || path_str.contains("copilot")
+fn is_copilot_record(record_type: &str, val: &serde_json::Value) -> bool {
+    record_type.starts_with("session.") && val.get("data").is_some() && val.get("id").is_some()
 }
 
-fn is_jsonl(path: &Path) -> bool {
-    path.extension().map_or(false, |ext| ext == "jsonl")
-}
-
-fn is_claude_record(val: &serde_json::Value) -> bool {
-    let has_typed_message = val.get("type").is_some() && val.get("message").is_some();
-    let is_summary = val.get("type").and_then(|t| t.as_str()) == Some("summary");
-    let has_session_id = val.get("sessionId").is_some();
-    (has_typed_message || is_summary) && has_session_id
-}
-
-fn is_copilot_record(val: &serde_json::Value) -> bool {
-    let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    let has_data = val.get("data").is_some();
-    let has_id = val.get("id").is_some();
-    event_type.starts_with("session.") && has_data && has_id
-}
-
-fn matches_codex_path(path: &Path) -> bool {
-    path.to_string_lossy().contains(".codex")
-}
-
-fn is_codex_record(val: &serde_json::Value) -> bool {
-    let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    event_type == "session_meta" && val.get("payload").is_some()
+fn is_codex_record(record_type: &str, val: &serde_json::Value) -> bool {
+    record_type == "session_meta" && val.get("payload").is_some()
 }
 
 #[cfg(test)]

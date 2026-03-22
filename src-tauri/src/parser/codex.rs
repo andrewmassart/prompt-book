@@ -2,498 +2,304 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use serde_json::Value;
+
 use crate::error::AppError;
 use crate::model::{
-    ContentBlock, Message, MessageMode, Role, Session, SessionMetadata, SessionSource, TokenUsage,
+    ContentBlock, Message, Role, Session, SessionMetadata, SessionSource,
 };
 
-/// Parse a Codex CLI session JSONL file.
-///
-/// Real Codex format uses these top-level event types:
-/// - `session_meta`     — session ID, cwd, git info, model_provider
-/// - `event_msg`        — payload.type: task_started, user_message, task_complete,
-///                         token_count, agent_message, thread_rolled_back
-/// - `response_item`    — payload.type: message (role: user/assistant/developer),
-///                         reasoning, function_call, function_call_output
-/// - `turn_context`     — model, collaboration_mode, turn_id
+use super::records::{CodexRecord, CodexSessionMeta, CodexTokenUsageInfo};
+use super::{
+    parse_mode, parse_tool_arguments, session_id_from_path,
+    truncate_to_chars, ParseEvent, ParseState,
+};
+
 pub fn parse_codex_session(path: &Path) -> Result<Session, AppError> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let session_id = session_id_from_path(path);
 
-    let mut session_id = String::new();
-    let mut started_at: Option<String> = None;
-    let mut model: Option<String> = None;
-    let mut messages: Vec<Message> = Vec::new();
-    let mut usage_accumulator = UsageAccumulator::new();
-    let mut current_mode = MessageMode::Normal;
-    let mut metadata = SessionMetadata {
-        working_directory: None,
-        git_branch: None,
-        slug: None,
-        repository: None,
+    let mut session = super::parse_jsonl_session(
+        path,
+        SessionSource::Codex,
+        session_id,
+        |line, state| {
+            let Ok(record) = serde_json::from_str::<CodexRecord>(line) else { return };
+            process_codex_record(&record, state);
+        },
+    )?;
+
+    if session.id.is_empty() {
+        session.id = session_id_from_path(path);
+    }
+
+    if session.title.is_none() {
+        session.title = title_from_session_index(&session.id);
+    }
+
+    Ok(session)
+}
+
+pub fn parse_codex_content(filename: &str, content: &str) -> Result<Session, AppError> {
+    let path = std::path::Path::new(filename);
+    let session_id = session_id_from_path(path);
+
+    let mut session = super::parse_jsonl_from_content(
+        content,
+        SessionSource::Codex,
+        session_id,
+        path,
+        |line, state| {
+            let Ok(record) = serde_json::from_str::<CodexRecord>(line) else { return };
+            process_codex_record(&record, state);
+        },
+    )?;
+
+    if session.id.is_empty() {
+        session.id = session_id_from_path(path);
+    }
+    if session.title.is_none() {
+        session.title = title_from_session_index(&session.id);
+    }
+
+    Ok(session)
+}
+
+fn process_codex_record(record: &CodexRecord, state: &mut ParseState) {
+    let timestamp = record.timestamp().map(String::from);
+
+    match record {
+        CodexRecord::SessionMeta { payload: Some(p), .. } => {
+            let (id, ts, meta) = session_meta_to_parts(p);
+            if !id.is_empty() {
+                state.apply(ParseEvent::SetSessionId(id));
+            }
+            if let Some(started) = ts.or_else(|| timestamp.clone()) {
+                state.apply(ParseEvent::SetStartedAt(started));
+            }
+            state.apply(ParseEvent::SetMetadata(meta));
+        }
+
+        CodexRecord::TurnContext { payload: Some(p), .. } => {
+            if let Some(m) = &p.model {
+                state.apply(ParseEvent::SetModel(m.clone()));
+            }
+            if let Some(mode_str) = p.collaboration_mode.as_ref().and_then(|cm| cm.mode.as_deref()) {
+                state.apply(ParseEvent::SetMode(parse_mode(mode_str)));
+            }
+        }
+
+        CodexRecord::EventMsg { payload: Some(p), .. } => {
+            process_event_msg(p, &timestamp, state);
+        }
+
+        CodexRecord::ResponseItem { payload: Some(p), .. } => {
+            process_response_item(p, state);
+        }
+
+        _ => {}
+    }
+}
+
+fn process_event_msg(p: &Value, timestamp: &Option<String>, state: &mut ParseState) {
+    match event_msg_type(p) {
+        "task_started" => {
+            if !state.turn_items.is_empty() {
+                state.apply(ParseEvent::FlushTurn { timestamp: None });
+            }
+            state.apply(ParseEvent::SetTurnTimestamp(timestamp.clone()));
+            if let Some(mode_str) = p.get("collaboration_mode_kind").and_then(Value::as_str) {
+                state.apply(ParseEvent::SetMode(parse_mode(mode_str)));
+            }
+        }
+        "user_message" => {
+            let mut content: Vec<ContentBlock> = p
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| ContentBlock::Text { text: text.to_string() })
+                .into_iter()
+                .collect();
+
+            if let Some(images) = p.get("images").and_then(Value::as_array) {
+                content.extend(images.iter().filter_map(extract_image_block));
+            }
+
+            if content.is_empty() {
+                content.push(ContentBlock::Text { text: String::new() });
+            }
+
+            state.apply(ParseEvent::AddMessage(Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::User,
+                timestamp: timestamp.clone(),
+                content,
+                mode: state.current_mode,
+                is_agent: false,
+                is_meta: false,
+                duration_ms: None,
+            }));
+        }
+        "task_complete" => {
+            state.apply(ParseEvent::FlushTurn { timestamp: None });
+        }
+        "agent_message" => {
+            if let Some(text) = p.get("message").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                state.apply(ParseEvent::PushTurnItem(ContentBlock::Text {
+                    text: text.to_string(),
+                }));
+            }
+        }
+        "token_count" => {
+            if let Some(usage) = extract_token_usage(p) {
+                state.apply(ParseEvent::MergeUsage {
+                    input: usage.input_tokens.unwrap_or(0),
+                    output: usage.output_tokens.unwrap_or(0),
+                    cache_read: usage.cached_input_tokens.unwrap_or(0),
+                    cache_write: 0,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn process_response_item(p: &Value, state: &mut ParseState) {
+    match p.get("type").and_then(Value::as_str).unwrap_or("") {
+        "message" => {
+            for block in parse_response_message(p) {
+                state.apply(ParseEvent::PushTurnItem(block));
+            }
+        }
+        "reasoning" => {
+            for block in parse_response_reasoning(p) {
+                state.apply(ParseEvent::PushTurnItem(block));
+            }
+        }
+        "function_call" => {
+            let tool_name = str_field(p, "name").unwrap_or("unknown");
+            let call_id = str_field(p, "call_id").unwrap_or("");
+            state.apply(ParseEvent::PushTurnItem(ContentBlock::ToolUse {
+                tool_name: format!("{tool_name}:{call_id}"),
+                tool_call_id: Some(call_id.to_string()),
+                input: parse_tool_arguments(p),
+                output: None,
+                duration_ms: None,
+            }));
+        }
+        "function_call_output" => {
+            let call_id = str_field(p, "call_id").unwrap_or("");
+            let output = p.get("output").and_then(Value::as_str).map(String::from);
+            state.apply(ParseEvent::AttachToolOutputBySuffix {
+                suffix: format!(":{call_id}"),
+                output,
+            });
+        }
+        _ => {}
+    }
+}
+
+fn extract_image_block(img: &Value) -> Option<ContentBlock> {
+    let url = img
+        .as_str()
+        .or_else(|| img.get("url").and_then(Value::as_str))?;
+    Some(ContentBlock::Image { source: url.to_string() })
+}
+
+fn str_field<'a>(val: &'a Value, key: &str) -> Option<&'a str> {
+    val.get(key).and_then(Value::as_str)
+}
+
+fn session_meta_to_parts(meta: &CodexSessionMeta) -> (String, Option<String>, SessionMetadata) {
+    let session_id = meta.id.clone().unwrap_or_default();
+    let started_at = meta.timestamp.clone();
+    let metadata = SessionMetadata {
+        working_directory: meta.cwd.clone(),
+        git_branch: meta.git.as_ref().and_then(|g| g.branch.clone()),
+        repository: meta.git.as_ref().and_then(|g| g.repository_url.clone()),
+        ..SessionMetadata::default()
     };
-
-    // Collect assistant content blocks between task_started and task_complete
-    let mut turn_items: Vec<ContentBlock> = Vec::new();
-    let mut turn_timestamp: Option<String> = None;
-    let mut in_turn = false;
-
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-
-        let event_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let timestamp = extract_timestamp(&record);
-        let payload = record.get("payload");
-
-        match event_type {
-            "session_meta" => {
-                if let Some(p) = payload {
-                    session_id = p
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    started_at = p
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                        .or(timestamp.clone());
-                    metadata.working_directory = p
-                        .get("cwd")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    if let Some(git) = p.get("git") {
-                        metadata.git_branch = git
-                            .get("branch")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                        metadata.repository = git
-                            .get("repository_url")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                    }
-                }
-            }
-
-            "turn_context" => {
-                if let Some(p) = payload {
-                    if model.is_none() {
-                        model = p
-                            .get("model")
-                            .and_then(|m| m.as_str())
-                            .map(String::from);
-                    }
-                    // Extract collaboration mode
-                    if let Some(mode_str) = p
-                        .get("collaboration_mode")
-                        .and_then(|cm| cm.get("mode"))
-                        .and_then(|m| m.as_str())
-                    {
-                        current_mode = match mode_str {
-                            "plan" => MessageMode::Plan,
-                            "auto" | "autopilot" | "full-auto" => MessageMode::Auto,
-                            _ => MessageMode::Normal,
-                        };
-                    }
-                }
-            }
-
-            "event_msg" => {
-                let Some(p) = payload else { continue };
-                let msg_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                match msg_type {
-                    "task_started" => {
-                        in_turn = true;
-                        turn_items.clear();
-                        turn_timestamp = timestamp.clone();
-                        // Update mode from collaboration_mode_kind
-                        if let Some(mode_str) = p
-                            .get("collaboration_mode_kind")
-                            .and_then(|m| m.as_str())
-                        {
-                            current_mode = match mode_str {
-                                "plan" => MessageMode::Plan,
-                                "auto" | "autopilot" | "full-auto" => MessageMode::Auto,
-                                _ => MessageMode::Normal,
-                            };
-                        }
-                    }
-                    "user_message" => {
-                        let mut content = Vec::new();
-                        if let Some(text) = p.get("message").and_then(|m| m.as_str()) {
-                            if !text.is_empty() {
-                                content.push(ContentBlock::Text {
-                                    text: text.to_string(),
-                                });
-                            }
-                        }
-                        // Handle images
-                        if let Some(images) = p.get("images").and_then(|i| i.as_array()) {
-                            for img in images {
-                                if let Some(url) = img.as_str() {
-                                    content.push(ContentBlock::Image {
-                                        source: url.to_string(),
-                                    });
-                                } else if let Some(url) = img.get("url").and_then(|u| u.as_str()) {
-                                    content.push(ContentBlock::Image {
-                                        source: url.to_string(),
-                                    });
-                                }
-                            }
-                        }
-                        if content.is_empty() {
-                            content.push(ContentBlock::Text {
-                                text: String::new(),
-                            });
-                        }
-                        messages.push(Message {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            role: Role::User,
-                            timestamp: timestamp.clone(),
-                            content,
-                            mode: current_mode.clone(),
-                            is_agent: false,
-                            is_meta: false,
-                            duration_ms: None,
-                        });
-                    }
-                    "task_complete" => {
-                        if in_turn && !turn_items.is_empty() {
-                            messages.push(Message {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                role: Role::Assistant,
-                                timestamp: turn_timestamp.take(),
-                                content: std::mem::take(&mut turn_items),
-                                mode: current_mode.clone(),
-                                is_agent: false,
-                                is_meta: false,
-                                duration_ms: None,
-                            });
-                        }
-                        in_turn = false;
-                    }
-                    "agent_message" => {
-                        if let Some(text) = p.get("message").and_then(|m| m.as_str()) {
-                            if !text.is_empty() {
-                                turn_items.push(ContentBlock::Text {
-                                    text: text.to_string(),
-                                });
-                            }
-                        }
-                    }
-                    "token_count" => {
-                        if let Some(info) = p.get("info") {
-                            if let Some(last) = info.get("last_token_usage") {
-                                usage_accumulator.add(last);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            "response_item" => {
-                let Some(p) = payload else { continue };
-                let item_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                match item_type {
-                    "message" => {
-                        let role = p.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                        match role {
-                            "assistant" => {
-                                // Extract text from content array
-                                if let Some(arr) = p.get("content").and_then(|c| c.as_array()) {
-                                    for block in arr {
-                                        let bt = block
-                                            .get("type")
-                                            .and_then(|t| t.as_str())
-                                            .unwrap_or("");
-                                        match bt {
-                                            "output_text" => {
-                                                if let Some(text) =
-                                                    block.get("text").and_then(|t| t.as_str())
-                                                {
-                                                    if !text.is_empty() {
-                                                        turn_items.push(ContentBlock::Text {
-                                                            text: text.to_string(),
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                            // user/developer messages are context replay, skip
-                            _ => {}
-                        }
-                    }
-                    "reasoning" => {
-                        // summary is an array of summary strings
-                        if let Some(summary) = p.get("summary").and_then(|s| s.as_array()) {
-                            let texts: Vec<String> = summary
-                                .iter()
-                                .filter_map(|item| {
-                                    item.get("text")
-                                        .and_then(|t| t.as_str())
-                                        .or_else(|| item.as_str())
-                                        .map(String::from)
-                                })
-                                .collect();
-                            let text = texts.join("\n");
-                            if !text.is_empty() {
-                                turn_items.push(ContentBlock::Thinking { text });
-                            }
-                        }
-                        // Fallback: content field (may be encrypted/null)
-                        if let Some(text) = p.get("content").and_then(|c| c.as_str()) {
-                            if !text.is_empty()
-                                && p.get("encrypted_content").is_none()
-                            {
-                                turn_items.push(ContentBlock::Thinking {
-                                    text: text.to_string(),
-                                });
-                            }
-                        }
-                    }
-                    "function_call" => {
-                        let tool_name = p
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let call_id = p
-                            .get("call_id")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let input = parse_arguments(p);
-                        turn_items.push(ContentBlock::ToolUse {
-                            tool_name: format!("{}:{}", tool_name, call_id),
-                            input,
-                            output: None,
-                            duration_ms: None,
-                        });
-                    }
-                    "function_call_output" => {
-                        let call_id = p
-                            .get("call_id")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("");
-                        let output = p
-                            .get("output")
-                            .and_then(|o| o.as_str())
-                            .map(String::from);
-
-                        // Find the matching function_call ToolUse and attach output
-                        let suffix = format!(":{}", call_id);
-                        let mut found = false;
-                        for item in turn_items.iter_mut().rev() {
-                            if let ContentBlock::ToolUse {
-                                tool_name,
-                                output: ref mut out,
-                                ..
-                            } = item
-                            {
-                                if tool_name.ends_with(&suffix) && out.is_none() {
-                                    // Restore clean tool name
-                                    *tool_name = tool_name
-                                        .strip_suffix(&suffix)
-                                        .unwrap_or(tool_name)
-                                        .to_string();
-                                    *out = output.clone();
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                        // Also check already-flushed messages
-                        if !found {
-                            for msg in messages.iter_mut().rev() {
-                                for item in msg.content.iter_mut().rev() {
-                                    if let ContentBlock::ToolUse {
-                                        tool_name,
-                                        output: ref mut out,
-                                        ..
-                                    } = item
-                                    {
-                                        if tool_name.ends_with(&suffix) && out.is_none() {
-                                            *tool_name = tool_name
-                                                .strip_suffix(&suffix)
-                                                .unwrap_or(tool_name)
-                                                .to_string();
-                                            *out = output.clone();
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            _ => {}
-        }
-    }
-
-    // Flush any remaining turn items
-    if !turn_items.is_empty() {
-        messages.push(Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            role: Role::Assistant,
-            timestamp: turn_timestamp.take(),
-            content: std::mem::take(&mut turn_items),
-            mode: current_mode.clone(),
-            is_agent: false,
-            is_meta: false,
-            duration_ms: None,
-        });
-    }
-
-    if session_id.is_empty() {
-        session_id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-    }
-
-    let title = title_from_first_user_message(&messages)
-        .or_else(|| title_from_session_index(&session_id));
-
-    super::calculate_durations(&mut messages);
-
-    Ok(Session {
-        id: session_id,
-        source: SessionSource::Codex,
-        source_path: path.to_path_buf(),
-        title,
-        model,
-        started_at,
-        messages,
-        token_usage: usage_accumulator.into_token_usage(),
-        metadata,
-    })
+    (session_id, started_at, metadata)
 }
 
-fn extract_timestamp(record: &serde_json::Value) -> Option<String> {
-    record
-        .get("timestamp")
-        .and_then(|t| t.as_str())
-        .map(String::from)
+fn event_msg_type(payload: &Value) -> &str {
+    payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
 }
 
-fn parse_arguments(payload: &serde_json::Value) -> serde_json::Value {
-    let args = payload
-        .get("arguments")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    if let Some(s) = args.as_str() {
-        serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.to_string()))
-    } else {
-        args
+fn extract_token_usage(payload: &Value) -> Option<CodexTokenUsageInfo> {
+    let last = payload.get("info")?.get("last_token_usage")?;
+    serde_json::from_value(last.clone()).ok()
+}
+
+fn parse_response_message(payload: &Value) -> Vec<ContentBlock> {
+    match payload.get("role").and_then(Value::as_str) {
+        Some("assistant") => {}
+        _ => return Vec::new(),
     }
-}
-
-fn title_from_first_user_message(messages: &[Message]) -> Option<String> {
-    messages
-        .iter()
-        .find(|m| m.role == Role::User)
-        .and_then(|m| m.content.first())
-        .and_then(|c| match c {
-            ContentBlock::Text { text } if !text.trim().is_empty() => {
-                Some(text.chars().take(100).collect())
+    payload
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            match block.get("type").and_then(Value::as_str) {
+                Some("output_text") => block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| ContentBlock::Text { text: text.to_string() }),
+                _ => None,
             }
-            _ => None,
         })
+        .collect()
+}
+
+fn parse_response_reasoning(payload: &Value) -> Vec<ContentBlock> {
+    let summary_block = payload
+        .get("summary")
+        .and_then(Value::as_array)
+        .map(|summary| {
+            summary
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.is_empty())
+        .map(|text| ContentBlock::Thinking { text });
+
+    let content_block = payload
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty() && payload.get("encrypted_content").is_none())
+        .map(|text| ContentBlock::Thinking { text: text.to_string() });
+
+    summary_block.into_iter().chain(content_block).collect()
 }
 
 fn title_from_session_index(session_id: &str) -> Option<String> {
-    let home = dirs::home_dir()?;
-    let index_path = home.join(".codex").join("session_index.jsonl");
+    let index_path = dirs::home_dir()?.join(".codex").join("session_index.jsonl");
     let file = File::open(index_path).ok()?;
     let reader = BufReader::new(file);
 
-    for line in reader.lines() {
-        let line = line.ok()?;
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if record.get("id").and_then(|id| id.as_str()) == Some(session_id) {
-            return record
-                .get("thread_name")
-                .and_then(|n| n.as_str())
-                .map(String::from);
+    reader.lines().map_while(Result::ok).find_map(|line| {
+        let record: Value = serde_json::from_str(&line).ok()?;
+        match record.get("id").and_then(Value::as_str) {
+            Some(id) if id == session_id => {
+                record.get("thread_name").and_then(Value::as_str).map(String::from)
+            }
+            _ => None,
         }
-    }
-    None
+    })
 }
 
-struct UsageAccumulator {
-    input_tokens: u64,
-    output_tokens: u64,
-    cached_input: u64,
-    has_data: bool,
-}
-
-impl UsageAccumulator {
-    fn new() -> Self {
-        Self {
-            input_tokens: 0,
-            output_tokens: 0,
-            cached_input: 0,
-            has_data: false,
-        }
-    }
-
-    fn add(&mut self, usage: &serde_json::Value) {
-        self.has_data = true;
-        self.input_tokens += usage
-            .get("input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        self.output_tokens += usage
-            .get("output_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        self.cached_input += usage
-            .get("cached_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-    }
-
-    fn into_token_usage(self) -> Option<TokenUsage> {
-        if !self.has_data {
-            return None;
-        }
-        Some(TokenUsage {
-            input_tokens: self.input_tokens,
-            output_tokens: self.output_tokens,
-            cache_read_tokens: if self.cached_input > 0 {
-                Some(self.cached_input)
-            } else {
-                None
-            },
-            cache_write_tokens: None,
-        })
-    }
-}
-
-pub fn scan_codex_summary(
-    path: &Path,
-) -> Result<(Option<String>, Option<String>, Option<String>, usize), AppError> {
+pub fn scan_codex_summary(path: &Path) -> super::ScanSummary {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
@@ -510,66 +316,45 @@ pub fn scan_codex_summary(
             continue;
         }
 
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
 
-        let event_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let event_type = record.get("type").and_then(Value::as_str).unwrap_or("");
         let payload = record.get("payload");
 
         match event_type {
             "session_meta" => {
                 if let Some(p) = payload {
-                    session_id = p
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    started_at = p
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                        .or_else(|| extract_timestamp(&record));
+                    session_id = p.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                    started_at = p.get("timestamp").and_then(Value::as_str).map(String::from)
+                        .or_else(|| record.get("timestamp")?.as_str().map(String::from));
                 }
             }
             "turn_context" => {
-                if model.is_none() {
-                    if let Some(p) = payload {
-                        model = p
-                            .get("model")
-                            .and_then(|m| m.as_str())
-                            .map(String::from);
-                    }
-                }
+                model = model.or_else(|| payload?.get("model")?.as_str().map(String::from));
             }
             "event_msg" => {
-                if let Some(p) = payload {
-                    let msg_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match msg_type {
-                        "user_message" => {
-                            message_count += 1;
-                            if title.is_none() {
-                                title = p
-                                    .get("message")
-                                    .and_then(|m| m.as_str())
-                                    .filter(|s| !s.trim().is_empty())
-                                    .map(|s| s.chars().take(100).collect());
-                            }
-                        }
-                        "task_complete" => {
-                            message_count += 1;
-                        }
-                        _ => {}
+                match payload.and_then(|p| p.get("type")).and_then(Value::as_str).unwrap_or("") {
+                    "user_message" => {
+                        message_count += 1;
+                        title = title.or_else(|| {
+                            payload?.get("message")?.as_str()
+                                .filter(|s| !s.trim().is_empty())
+                                .map(|s| truncate_to_chars(s, 100))
+                        });
                     }
+                    "task_complete" => {
+                        message_count += 1;
+                    }
+                    _ => {}
                 }
             }
             _ => {}
         }
     }
 
-    if title.is_none() {
-        title = title_from_session_index(&session_id);
-    }
+    title = title.or_else(|| title_from_session_index(&session_id));
 
     Ok((title, model, started_at, message_count))
 }
@@ -577,6 +362,7 @@ pub fn scan_codex_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::MessageMode;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -609,16 +395,13 @@ mod tests {
         assert_eq!(session.metadata.working_directory, Some("/home/user/project".to_string()));
         assert_eq!(session.metadata.git_branch, Some("main".to_string()));
 
-        // Should have: 1 user message + 1 assistant message
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].role, Role::User);
         assert_eq!(session.messages[1].role, Role::Assistant);
         assert_eq!(session.messages[0].mode, MessageMode::Plan);
 
-        // Title from user_message
         assert_eq!(session.title, Some("Fix the login bug".to_string()));
 
-        // Token usage from token_count event
         let usage = session.token_usage.unwrap();
         assert_eq!(usage.input_tokens, 500);
         assert_eq!(usage.output_tokens, 200);
@@ -638,9 +421,9 @@ mod tests {
         let file = write_jsonl(jsonl);
         let session = parse_codex_session(file.path()).unwrap();
 
-        assert_eq!(session.messages.len(), 2); // user + assistant
+        assert_eq!(session.messages.len(), 2);
         let assistant = &session.messages[1];
-        assert_eq!(assistant.content.len(), 2); // tool_use + text
+        assert_eq!(assistant.content.len(), 2);
         if let ContentBlock::ToolUse {
             tool_name, output, input, ..
         } = &assistant.content[0]
@@ -692,7 +475,7 @@ mod tests {
         let file = write_jsonl(jsonl);
         let session = parse_codex_session(file.path()).unwrap();
 
-        assert_eq!(session.messages.len(), 4); // 2 user + 2 assistant
+        assert_eq!(session.messages.len(), 4);
         let usage = session.token_usage.unwrap();
         assert_eq!(usage.input_tokens, 300);
         assert_eq!(usage.output_tokens, 130);
@@ -712,6 +495,6 @@ mod tests {
         assert_eq!(title, Some("Build a REST API".to_string()));
         assert_eq!(model, Some("gpt-5.3-codex".to_string()));
         assert_eq!(started_at, Some("2026-03-20T10:00:00Z".to_string()));
-        assert_eq!(count, 2); // 1 user_message + 1 task_complete
+        assert_eq!(count, 2);
     }
 }

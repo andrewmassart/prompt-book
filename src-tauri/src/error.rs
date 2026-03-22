@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+/// Application-level errors for session parsing and I/O operations.
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("IO error: {0}")]

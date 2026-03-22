@@ -1,16 +1,13 @@
 import { useState } from "react";
+import { formatDuration } from "../lib/formatters";
+import type { ContentBlock } from "../lib/types";
+import { Collapsible } from "./Collapsible";
 
 interface ToolCallBlockProps {
-  block: {
-    type: "tool_use";
-    toolName: string;
-    input: unknown;
-    output?: string;
-    durationMs?: number;
-  };
+  block: Extract<ContentBlock, { type: "tool_use" }>;
 }
 
-const COLLAPSED_HEIGHT = "300px";
+const LINE_THRESHOLD = 15;
 
 const styles = {
   container: {
@@ -69,39 +66,19 @@ const styles = {
     wordBreak: "break-all" as const,
     lineHeight: 1.5,
     overflow: "auto" as const,
-    transition: "max-height 0.2s ease",
-  },
-  expandBtn: {
-    background: "none",
-    border: "none",
-    color: "var(--accent)",
-    cursor: "pointer",
-    fontSize: "0.8em",
-    padding: "4px 0",
-    marginTop: "4px",
   },
 };
 
-function formatToolDuration(ms: number): string {
-  if (ms < 1000) return `${ms} ms`;
-  const seconds = ms / 1000;
-  if (seconds < 60) return `${seconds.toFixed(1)} s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = Math.round(seconds % 60);
-  return `${minutes} m ${remainingSeconds} s`;
-}
-
 export function ToolCallBlock({ block }: Readonly<ToolCallBlockProps>) {
   const [open, setOpen] = useState(false);
-  const [expanded, setExpanded] = useState(false);
 
   const inputStr =
     typeof block.input === "string"
       ? block.input
       : JSON.stringify(block.input, null, 2);
 
-  const inputIsLarge = inputStr.split("\n").length > 15;
-  const outputIsLarge = (block.output?.split("\n").length ?? 0) > 15;
+  const inputIsLong = inputStr.split("\n").length > LINE_THRESHOLD;
+  const outputIsLong = (block.output?.split("\n").length ?? 0) > LINE_THRESHOLD;
 
   return (
     <div style={styles.container}>
@@ -115,36 +92,22 @@ export function ToolCallBlock({ block }: Readonly<ToolCallBlockProps>) {
         </span>
         <span style={styles.toolName}>{block.toolName}</span>
         {block.durationMs !== undefined && (
-          <span style={styles.duration}>{formatToolDuration(block.durationMs)}</span>
+          <span style={styles.duration}>{formatDuration(block.durationMs)}</span>
         )}
       </button>
       {open && (
         <div style={styles.body}>
           <div style={styles.label}>Input</div>
-          <pre style={{
-            ...styles.pre,
-            maxHeight: expanded ? "none" : COLLAPSED_HEIGHT,
-          }}>
-            {inputStr}
-          </pre>
+          <Collapsible maxHeight={300} isLong={inputIsLong} fadeBg="var(--bg-input)">
+            <pre style={styles.pre}>{inputStr}</pre>
+          </Collapsible>
           {block.output && (
             <>
               <div style={{ ...styles.label, marginTop: "12px" }}>Output</div>
-              <pre style={{
-                ...styles.pre,
-                maxHeight: expanded ? "none" : COLLAPSED_HEIGHT,
-              }}>
-                {block.output}
-              </pre>
+              <Collapsible maxHeight={300} isLong={outputIsLong} fadeBg="var(--bg-input)">
+                <pre style={styles.pre}>{block.output}</pre>
+              </Collapsible>
             </>
-          )}
-          {(inputIsLarge || outputIsLarge) && (
-            <button
-              style={styles.expandBtn}
-              onClick={() => setExpanded(!expanded)}
-            >
-              {expanded ? "Collapse" : "Show full content"}
-            </button>
           )}
         </div>
       )}

@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useState, useEffect } from "react";
 import type { SessionSummary } from "../lib/types";
+import { invokeCommand } from "../lib/commands";
+import { errorMessage } from "../lib/error";
 
 interface UseDiscoverResult {
   sessions: SessionSummary[];
@@ -19,10 +20,10 @@ export function useDiscover(): UseDiscoverResult {
     setLoading(true);
     setError(null);
     try {
-      const result = await invoke<SessionSummary[]>("discover_sessions");
+      const result = await invokeCommand("discover_sessions", {});
       setSessions(result);
     } catch (err) {
-      setError(String(err));
+      setError(errorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -32,12 +33,12 @@ export function useDiscover(): UseDiscoverResult {
     fetchSessions();
   }, []);
 
-  const addSession = useCallback((summary: SessionSummary) => {
+  const addSession = (summary: SessionSummary) => {
     setSessions((prev) => {
       const filtered = prev.filter((s) => s.id !== summary.id);
       return [summary, ...filtered];
     });
-  }, []);
+  };
 
   return { sessions, loading, error, refresh: fetchSessions, addSession };
 }

@@ -1,5 +1,7 @@
-import { useRef, useState, useEffect, useCallback } from "react";
-import type { Session, Message } from "../lib/types";
+import { useRef, useState, useEffect } from "react";
+import type { Session } from "../lib/types";
+import { formatTokens } from "../lib/formatters";
+import { hasVisibleContent } from "../lib/content";
 import { MessageBubble } from "./MessageBubble";
 
 interface SessionViewProps {
@@ -97,44 +99,20 @@ const styles = {
   },
 };
 
-function hasVisibleContent(msg: Message): boolean {
-  if (msg.content.length === 0) return false;
-  return msg.content.some((block) => {
-    switch (block.type) {
-      case "text":
-        return block.text.trim().length > 0;
-      case "thinking":
-        return block.text.trim().length > 0;
-      case "tool_use":
-      case "code_block":
-      case "image":
-        return true;
-      default:
-        return false;
-    }
-  });
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
-  return String(n);
-}
-
 export function SessionView({ session, loading, error }: Readonly<SessionViewProps>) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showFab, setShowFab] = useState(false);
 
-  const handleScroll = useCallback(() => {
+  const handleScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     setShowFab(distanceFromBottom > 0);
-  }, []);
+  };
 
-  const scrollToBottom = useCallback(() => {
+  const scrollToBottom = () => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, []);
+  };
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -201,10 +179,9 @@ export function SessionView({ session, loading, error }: Readonly<SessionViewPro
       </div>
       {showFab && (
         <button
+          className="fab-hover"
           style={styles.fab}
           onClick={scrollToBottom}
-          onMouseEnter={(e) => { e.currentTarget.style.opacity = "0.8"; }}
-          onMouseLeave={(e) => { e.currentTarget.style.opacity = "1"; }}
         >
           &#8595;
         </button>

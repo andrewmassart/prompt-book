@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { SessionSummary } from "../lib/types";
+import { formatDate } from "../lib/formatters";
 
 interface SessionListProps {
   sessions: SessionSummary[];
@@ -99,35 +100,13 @@ const styles = {
   },
 };
 
-function formatDate(iso?: string): string {
-  if (!iso) return "";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleDateString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return iso;
-  }
-}
-
 function HeaderButton({ onClick, disabled, label }: Readonly<{ onClick: () => void; disabled?: boolean; label: string }>) {
   return (
     <button
+      className="hover-accent"
       style={styles.refreshBtn}
       onClick={onClick}
       disabled={disabled}
-      onMouseEnter={(e) => {
-        e.currentTarget.style.borderColor = "var(--accent)";
-        e.currentTarget.style.color = "var(--accent)";
-      }}
-      onMouseLeave={(e) => {
-        e.currentTarget.style.borderColor = "var(--border-color)";
-        e.currentTarget.style.color = "var(--text-secondary)";
-      }}
     >
       {label}
     </button>

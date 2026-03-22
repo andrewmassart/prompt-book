@@ -1,6 +1,7 @@
-import { useState, useCallback, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useState, useRef } from "react";
 import type { Session } from "../lib/types";
+import { invokeCommand } from "../lib/commands";
+import { errorMessage } from "../lib/error";
 
 interface UseSessionResult {
   session: Session | null;
@@ -18,12 +19,12 @@ export function useSession(): UseSessionResult {
   const [error, setError] = useState<string | null>(null);
   const cache = useRef<Map<string, Session>>(new Map());
 
-  const cacheAndSet = useCallback((result: Session) => {
+  const cacheAndSet = (result: Session) => {
     cache.current.set(result.id, result);
     setSession(result);
-  }, []);
+  };
 
-  const loadById = useCallback((id: string): boolean => {
+  const loadById = (id: string): boolean => {
     const cached = cache.current.get(id);
     if (cached) {
       setSession(cached);
@@ -31,50 +32,50 @@ export function useSession(): UseSessionResult {
       return true;
     }
     return false;
-  }, []);
+  };
 
-  const loadSession = useCallback(async (path: string) => {
+  const loadSession = async (path: string) => {
     setLoading(true);
     setError(null);
     try {
-      const result = await invoke<Session>("parse_session", { path });
+      const result = await invokeCommand("parse_session", { path });
       cacheAndSet(result);
     } catch (err) {
-      setError(String(err));
+      setError(errorMessage(err));
     } finally {
       setLoading(false);
     }
-  }, [cacheAndSet]);
+  };
 
-  const loadDroppedFile = useCallback(async (path: string): Promise<Session | null> => {
+  const loadDroppedFile = async (path: string): Promise<Session | null> => {
     setLoading(true);
     setError(null);
     try {
-      const result = await invoke<Session>("parse_dropped_file", { path });
+      const result = await invokeCommand("parse_dropped_file", { path });
       cacheAndSet(result);
       return result;
     } catch (err) {
-      setError(String(err));
+      setError(errorMessage(err));
       return null;
     } finally {
       setLoading(false);
     }
-  }, [cacheAndSet]);
+  };
 
-  const loadContent = useCallback(async (filename: string, content: string): Promise<Session | null> => {
+  const loadContent = async (filename: string, content: string): Promise<Session | null> => {
     setLoading(true);
     setError(null);
     try {
-      const result = await invoke<Session>("parse_content", { filename, content });
+      const result = await invokeCommand("parse_content", { filename, content });
       cacheAndSet(result);
       return result;
     } catch (err) {
-      setError(String(err));
+      setError(errorMessage(err));
       return null;
     } finally {
       setLoading(false);
     }
-  }, [cacheAndSet]);
+  };
 
   return { session, loading, error, loadSession, loadDroppedFile, loadContent, loadById };
 }

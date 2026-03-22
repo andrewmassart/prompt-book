@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, type DragEvent, type ReactNode } from "react";
+import { useState, useRef, type DragEvent, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 
 interface DropZoneProps {
@@ -15,7 +15,7 @@ const styles = {
   overlay: {
     position: "absolute" as const,
     inset: 0,
-    background: "rgba(22, 22, 22, 0.92)",
+    background: "var(--bg-overlay)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -35,44 +35,41 @@ export function DropZone({ onFileContent, children }: Readonly<DropZoneProps>) {
   const [dragging, setDragging] = useState(false);
   const dragCounterRef = useRef(0);
 
-  const handleDragEnter = useCallback((e: DragEvent) => {
+  const handleDragEnter = (e: DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     dragCounterRef.current++;
     if (dragCounterRef.current === 1) setDragging(true);
-  }, []);
+  };
 
-  const handleDragLeave = useCallback((e: DragEvent) => {
+  const handleDragLeave = (e: DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     dragCounterRef.current--;
     if (dragCounterRef.current === 0) setDragging(false);
-  }, []);
+  };
 
-  const handleDragOver = useCallback((e: DragEvent) => {
+  const handleDragOver = (e: DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-  }, []);
+  };
 
-  const handleDrop = useCallback(
-    (e: DragEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      setDragging(false);
-      dragCounterRef.current = 0;
+  const handleDrop = (e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragging(false);
+    dragCounterRef.current = 0;
 
-      const files = e.dataTransfer?.files;
-      if (!files || files.length === 0) return;
+    const files = e.dataTransfer?.files;
+    if (!files || files.length === 0) return;
 
-      for (const file of Array.from(files)) {
-        if (file.name.endsWith(".jsonl")) {
-          void file.text().then((content) => onFileContent(file.name, content));
-          return;
-        }
+    for (const file of Array.from(files)) {
+      if (file.name.endsWith(".jsonl")) {
+        file.text().then((content) => onFileContent(file.name, content)).catch(console.error);
+        return;
       }
-    },
-    [onFileContent],
-  );
+    }
+  };
 
   return (
     <div

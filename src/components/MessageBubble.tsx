@@ -1,5 +1,7 @@
-import { useState } from "react";
 import type { Message, ContentBlock, MessageMode } from "../lib/types";
+import { formatDuration, formatTime } from "../lib/formatters";
+import { estimateLineCount } from "../lib/content";
+import { Collapsible } from "./Collapsible";
 import { ToolCallBlock } from "./ToolCallBlock";
 import { ThinkingBlock } from "./ThinkingBlock";
 
@@ -80,27 +82,6 @@ const styles = {
     letterSpacing: "0.05em",
     lineHeight: 1.4,
   },
-  contentWrapper: {
-    overflow: "hidden" as const,
-    position: "relative" as const,
-    transition: "max-height 0.2s ease",
-  },
-  fade: {
-    position: "absolute" as const,
-    bottom: 0,
-    left: 0,
-    right: 0,
-    height: "60px",
-    background: "linear-gradient(transparent, var(--bg-secondary))",
-    pointerEvents: "none" as const,
-  },
-  expandBtn: {
-    background: "none",
-    border: "none",
-    cursor: "pointer",
-    fontSize: "0.8em",
-    padding: "6px 0 0",
-  },
   textContent: {
     whiteSpace: "pre-wrap" as const,
     wordWrap: "break-word" as const,
@@ -130,81 +111,78 @@ const styles = {
   },
 };
 
-function formatTime(iso?: string): string {
-  if (!iso) return "";
-  try {
-    return new Date(iso).toLocaleTimeString(undefined, {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-  } catch {
-    return "";
+function blockKey(block: ContentBlock, index: number): string {
+  switch (block.type) {
+    case "tool_use": return `tool-${block.toolName}-${index}`;
+    case "text": return `text-${index}`;
+    case "thinking": return `think-${index}`;
+    case "code_block": return `code-${index}`;
+    case "image": return `img-${index}`;
   }
 }
 
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms} ms`;
-  const seconds = ms / 1000;
-  if (seconds < 60) return `${seconds.toFixed(1)} s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = Math.round(seconds % 60);
-  return `${minutes} m ${remainingSeconds} s`;
-}
-
-function estimateLineCount(content: ContentBlock[]): number {
-  let lines = 0;
-  for (const block of content) {
-    switch (block.type) {
-      case "text":
-        lines += block.text.split("\n").length;
-        break;
-      case "code_block":
-        lines += block.code.split("\n").length;
-        break;
-      case "tool_use":
-      case "thinking":
-        lines += 2;
-        break;
-      default:
-        lines += 1;
-    }
-  }
-  return lines;
-}
-
-function renderBlock(block: ContentBlock, index: number) {
+function renderBlock(block: ContentBlock, key: string) {
   switch (block.type) {
     case "text":
-      return (
-        <div key={index} style={styles.textContent}>
-          {block.text}
-        </div>
-      );
+      return <div key={key} style={styles.textContent}>{block.text}</div>;
     case "tool_use":
-      return <ToolCallBlock key={index} block={block} />;
+      return <ToolCallBlock key={key} block={block} />;
     case "thinking":
-      return <ThinkingBlock key={index} text={block.text} />;
+      return <ThinkingBlock key={key} text={block.text} />;
     case "code_block":
       return (
-        <div key={index}>
+        <div key={key}>
           {block.language && <div style={styles.codeLang}>{block.language}</div>}
           <pre style={styles.codeBlock}>{block.code}</pre>
         </div>
       );
     case "image":
-      return <img key={index} src={block.source} alt="embedded" style={styles.image} />;
-    default:
-      return null;
+      return <img key={key} src={block.source} alt="embedded" style={styles.image} />;
   }
+}
+
+function MessageHeader({ message }: { message: Message }) {
+  const color = roleColors[message.role] || "var(--border-color)";
+  const modeLabel = modeLabels[message.mode];
+  const modeColor = modeColors[message.mode];
+
+  return (
+    <div style={styles.headerRow}>
+      <span style={{ ...styles.roleLabel, color: message.isAgent ? "var(--agent-border)" : color }}>
+        {message.isAgent ? `agent / ${message.role}` : message.role}
+      </span>
+      {modeLabel && modeColor && (
+        <span style={{ ...styles.badge, color: modeColor, border: `1px solid ${modeColor}` }}>
+          {modeLabel}
+        </span>
+      )}
+      {message.isMeta && (
+        <span style={{ ...styles.badge, color: "var(--text-muted)", border: "1px solid var(--text-muted)" }}>
+          META
+        </span>
+      )}
+      {message.timestamp && (
+        <span style={styles.timestamp}>{formatTime(message.timestamp)}</span>
+      )}
+      {message.durationMs != null && (
+        <span style={styles.duration}>{formatDuration(message.durationMs)}</span>
+      )}
+    </div>
+  );
+}
+
+function MessageContent({ message, color }: { message: Message; color: string }) {
+  const isLong = estimateLineCount(message.content) > LINE_THRESHOLD;
+
+  return (
+    <Collapsible maxHeight={COLLAPSED_HEIGHT} isLong={isLong} buttonColor={color}>
+      {message.content.map((block, i) => renderBlock(block, blockKey(block, i)))}
+    </Collapsible>
+  );
 }
 
 export function MessageBubble({ message }: Readonly<MessageBubbleProps>) {
   const color = roleColors[message.role] || "var(--border-color)";
-  const modeLabel = modeLabels[message.mode];
-  const modeColor = modeColors[message.mode];
-  const isLong = estimateLineCount(message.content) > LINE_THRESHOLD;
-  const [expanded, setExpanded] = useState(!isLong);
 
   const bubbleStyle = {
     ...styles.bubble,
@@ -215,62 +193,8 @@ export function MessageBubble({ message }: Readonly<MessageBubbleProps>) {
 
   return (
     <div style={bubbleStyle}>
-      <div style={styles.headerRow}>
-        <span style={{ ...styles.roleLabel, color: message.isAgent ? "var(--agent-border)" : color }}>
-          {message.isAgent ? `agent / ${message.role}` : message.role}
-        </span>
-        {modeLabel && modeColor && (
-          <span
-            style={{
-              ...styles.badge,
-              color: modeColor,
-              border: `1px solid ${modeColor}`,
-            }}
-          >
-            {modeLabel}
-          </span>
-        )}
-        {message.isMeta && (
-          <span
-            style={{
-              ...styles.badge,
-              color: "var(--text-muted)",
-              border: "1px solid var(--text-muted)",
-            }}
-          >
-            META
-          </span>
-        )}
-        {message.timestamp && (
-          <span style={styles.timestamp}>{formatTime(message.timestamp)}</span>
-        )}
-        {message.durationMs != null && (
-          <span style={styles.duration}>{formatDuration(message.durationMs)}</span>
-        )}
-      </div>
-      <div style={{
-        ...styles.contentWrapper,
-        maxHeight: expanded ? "none" : `${COLLAPSED_HEIGHT}px`,
-      }}>
-        {message.content.map((block, i) => renderBlock(block, i))}
-        {!expanded && <div style={styles.fade} />}
-      </div>
-      {isLong && !expanded && (
-        <button
-          style={{ ...styles.expandBtn, color }}
-          onClick={() => setExpanded(true)}
-        >
-          Show more
-        </button>
-      )}
-      {isLong && expanded && (
-        <button
-          style={{ ...styles.expandBtn, color }}
-          onClick={() => setExpanded(false)}
-        >
-          Show less
-        </button>
-      )}
+      <MessageHeader message={message} />
+      <MessageContent message={message} color={color} />
     </div>
   );
 }

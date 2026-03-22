@@ -4,9 +4,7 @@ A native desktop viewer for your AI coding sessions. Prompt Book reads session t
 
 Built with Tauri v2, React 19, and Rust.
 
-<!-- TODO: Add screenshot
 ![Prompt Book screenshot](docs/screenshot.png)
--->
 
 ## Install
 

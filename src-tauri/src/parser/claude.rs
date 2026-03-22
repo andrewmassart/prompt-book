@@ -7,8 +7,8 @@ use crate::model::{ContentBlock, Message, MessageMode, Role, Session, SessionSou
 
 use super::records::{ClaudeContentBlock, ClaudeRecord};
 use super::{
-    is_meaningful_title, session_id_from_path,
-    truncate_to_chars, ParseEvent, ParseState,
+    clean_command_xml, extract_title_from_text, session_id_from_path,
+    ParseEvent, ParseState,
 };
 
 pub fn parse_claude_session(path: &Path) -> Result<Session, AppError> {
@@ -172,17 +172,21 @@ fn title_from_path(path: &Path) -> Option<String> {
     None
 }
 
+fn clean_text(text: &str) -> String {
+    clean_command_xml(text).unwrap_or_else(|| text.to_string())
+}
+
 fn parse_content_block(block: &serde_json::Value) -> Option<ContentBlock> {
     let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match block_type {
         "image" => parse_image_block(block.get("source")),
-        _ => block.get("text")?.as_str().map(|t| ContentBlock::Text { text: t.to_string() }),
+        _ => block.get("text")?.as_str().map(|t| ContentBlock::Text { text: clean_text(t) }),
     }
 }
 
 fn extract_content_blocks(msg_content: &serde_json::Value) -> Vec<ContentBlock> {
     if let Some(text) = msg_content.as_str() {
-        return vec![ContentBlock::Text { text: text.to_string() }];
+        return vec![ContentBlock::Text { text: clean_text(text) }];
     }
     msg_content.as_array()
         .map(|arr| arr.iter().filter_map(parse_content_block).collect())
@@ -297,7 +301,7 @@ pub fn scan_claude_summary(path: &Path) -> super::ScanSummary {
                     let content = record.get("message")?.get("content")?;
                     let text = content.as_str()
                         .or_else(|| content.as_array()?.first()?.get("text")?.as_str())?;
-                    is_meaningful_title(text).then(|| truncate_to_chars(text.trim(), 100))
+                    extract_title_from_text(text)
                 });
             }
             "assistant" => {

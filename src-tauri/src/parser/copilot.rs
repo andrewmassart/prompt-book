@@ -7,7 +7,7 @@ use super::records::{
     CopilotAssistantData, CopilotRecord, CopilotShutdownData, CopilotToolCompleteData,
     CopilotUserMessageData,
 };
-use super::{truncate_to_chars, ParseEvent, ParseState, UsageAccumulator};
+use super::{extract_title_from_text, ParseEvent, ParseState, UsageAccumulator};
 use crate::error::AppError;
 use crate::model::{
     ContentBlock, Message, MessageMode, Role, Session, SessionMetadata, SessionSource, TokenUsage,
@@ -343,11 +343,8 @@ pub fn scan_copilot_summary(path: &Path) -> super::ScanSummary {
             "user.message" => {
                 message_count += 1;
                 title = title.or_else(|| {
-                    record
-                        .get("data")?
-                        .get("content")?
-                        .as_str()
-                        .map(|s| truncate_to_chars(s, 100))
+                    let text = record.get("data")?.get("content")?.as_str()?;
+                    extract_title_from_text(text)
                 });
             }
             "assistant.message" => {

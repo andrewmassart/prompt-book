@@ -91,7 +91,7 @@ export function ToolCallBlock({ block }: Readonly<ToolCallBlockProps>) {
           &#9654;
         </span>
         <span style={styles.toolName}>{block.toolName}</span>
-        {block.durationMs !== undefined && (
+        {block.durationMs != null && (
           <span style={styles.duration}>{formatDuration(block.durationMs)}</span>
         )}
       </button>

@@ -11,8 +11,8 @@ use crate::model::{
 
 use super::records::{CodexRecord, CodexSessionMeta, CodexTokenUsageInfo};
 use super::{
-    parse_mode, parse_tool_arguments, session_id_from_path,
-    truncate_to_chars, ParseEvent, ParseState,
+    extract_title_from_text, parse_mode, parse_tool_arguments, session_id_from_path,
+    ParseEvent, ParseState,
 };
 
 pub fn parse_codex_session(path: &Path) -> Result<Session, AppError> {
@@ -93,7 +93,7 @@ fn process_codex_record(record: &CodexRecord, state: &mut ParseState) {
         }
 
         CodexRecord::ResponseItem { payload: Some(p), .. } => {
-            process_response_item(p, state);
+            process_response_item(p, &timestamp, state);
         }
 
         _ => {}
@@ -140,14 +140,10 @@ fn process_event_msg(p: &Value, timestamp: &Option<String>, state: &mut ParseSta
             }));
         }
         "task_complete" => {
-            state.apply(ParseEvent::FlushTurn { timestamp: None });
+            state.apply(ParseEvent::FlushTurn { timestamp: timestamp.clone() });
         }
         "agent_message" => {
-            if let Some(text) = p.get("message").and_then(Value::as_str).filter(|t| !t.is_empty()) {
-                state.apply(ParseEvent::PushTurnItem(ContentBlock::Text {
-                    text: text.to_string(),
-                }));
-            }
+            // Duplicate of the response_item/message that follows — skip.
         }
         "token_count" => {
             if let Some(usage) = extract_token_usage(p) {
@@ -163,7 +159,7 @@ fn process_event_msg(p: &Value, timestamp: &Option<String>, state: &mut ParseSta
     }
 }
 
-fn process_response_item(p: &Value, state: &mut ParseState) {
+fn process_response_item(p: &Value, timestamp: &Option<String>, state: &mut ParseState) {
     match p.get("type").and_then(Value::as_str).unwrap_or("") {
         "message" => {
             for block in parse_response_message(p) {
@@ -178,6 +174,9 @@ fn process_response_item(p: &Value, state: &mut ParseState) {
         "function_call" => {
             let tool_name = str_field(p, "name").unwrap_or("unknown");
             let call_id = str_field(p, "call_id").unwrap_or("");
+            if let Some(ts) = timestamp {
+                state.tool_call_timestamps.insert(call_id.to_string(), ts.clone());
+            }
             state.apply(ParseEvent::PushTurnItem(ContentBlock::ToolUse {
                 tool_name: format!("{tool_name}:{call_id}"),
                 tool_call_id: Some(call_id.to_string()),
@@ -189,9 +188,16 @@ fn process_response_item(p: &Value, state: &mut ParseState) {
         "function_call_output" => {
             let call_id = str_field(p, "call_id").unwrap_or("");
             let output = p.get("output").and_then(Value::as_str).map(String::from);
+            let duration_ms = state.tool_call_timestamps.remove(call_id)
+                .zip(timestamp.clone())
+                .and_then(|(start, end)| ParseState::ms_between(
+                    ParseState::parse_ts(Some(&start)),
+                    ParseState::parse_ts(Some(&end)),
+                ));
             state.apply(ParseEvent::AttachToolOutputBySuffix {
                 suffix: format!(":{call_id}"),
                 output,
+                duration_ms,
             });
         }
         _ => {}
@@ -326,6 +332,9 @@ pub fn scan_codex_summary(path: &Path) -> super::ScanSummary {
         match event_type {
             "session_meta" => {
                 if let Some(p) = payload {
+                    if p.get("source").and_then(|s| s.get("subagent")).is_some() {
+                        return Ok((None, None, None, 0));
+                    }
                     session_id = p.get("id").and_then(Value::as_str).unwrap_or("").to_string();
                     started_at = p.get("timestamp").and_then(Value::as_str).map(String::from)
                         .or_else(|| record.get("timestamp")?.as_str().map(String::from));
@@ -339,9 +348,8 @@ pub fn scan_codex_summary(path: &Path) -> super::ScanSummary {
                     "user_message" => {
                         message_count += 1;
                         title = title.or_else(|| {
-                            payload?.get("message")?.as_str()
-                                .filter(|s| !s.trim().is_empty())
-                                .map(|s| truncate_to_chars(s, 100))
+                            let text = payload?.get("message")?.as_str()?;
+                            extract_title_from_text(text)
                         });
                     }
                     "task_complete" => {

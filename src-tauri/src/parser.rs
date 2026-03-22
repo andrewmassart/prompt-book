@@ -94,26 +94,26 @@ pub(crate) fn truncate_to_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// Derives a session title from the first meaningful user message.
-pub(crate) fn title_from_first_user_message(messages: &[Message]) -> Option<String> {
-    messages
-        .iter()
-        .filter(|m| m.role == Role::User && !m.is_meta)
-        .filter_map(|m| {
-            m.content.iter().find_map(|c| match c {
-                ContentBlock::Text { text } if is_meaningful_title(text) => {
-                    Some(truncate_to_chars(text.trim(), 100))
-                }
-                _ => None,
-            })
-        })
-        .next()
+/// Cleans up CLI command XML tags into readable text.
+///
+/// Converts `<command-name>/clear</command-name>...` into `/clear`.
+pub(crate) fn clean_command_xml(text: &str) -> Option<String> {
+    let text = text.trim();
+    let name = text.strip_prefix("<command-name>")?
+        .split("</command-name>")
+        .next()?;
+    Some(name.to_string())
 }
 
-pub(crate) fn is_meaningful_title(text: &str) -> bool {
-    let trimmed = text.trim();
+/// Cleans raw text and returns a title if it's meaningful.
+///
+/// Applies command XML cleanup, noise filtering, and truncation.
+/// Used by both the full parse path and the scan/summary path.
+pub(crate) fn extract_title_from_text(raw: &str) -> Option<String> {
+    let cleaned = clean_command_xml(raw).unwrap_or_else(|| raw.to_string());
+    let trimmed = cleaned.trim();
     if trimmed.is_empty() || trimmed.len() < 5 {
-        return false;
+        return None;
     }
     let noise_prefixes = [
         "[Request interrupted",
@@ -121,8 +121,25 @@ pub(crate) fn is_meaningful_title(text: &str) -> bool {
         "<system-reminder",
         "<caveat",
         "Set model to",
+        "<command-name",
     ];
-    !noise_prefixes.iter().any(|p| trimmed.starts_with(p))
+    if noise_prefixes.iter().any(|p| trimmed.starts_with(p)) {
+        return None;
+    }
+    Some(truncate_to_chars(trimmed, 100))
+}
+
+/// Derives a session title from the first meaningful user message.
+pub(crate) fn title_from_first_user_message(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .filter(|m| m.role == Role::User && !m.is_meta)
+        .find_map(|m| {
+            m.content.iter().find_map(|c| match c {
+                ContentBlock::Text { text } => extract_title_from_text(text),
+                _ => None,
+            })
+        })
 }
 
 /// Parses tool call arguments from a JSON payload, handling string-encoded JSON.
@@ -209,7 +226,7 @@ pub(crate) enum ParseEvent {
     SetTokenUsage(Option<TokenUsage>),
     SetMetadata(SessionMetadata),
     AttachToolOutputById { tool_call_id: String, output: Option<String>, duration_ms: Option<u64> },
-    AttachToolOutputBySuffix { suffix: String, output: Option<String> },
+    AttachToolOutputBySuffix { suffix: String, output: Option<String>, duration_ms: Option<u64> },
     PushTurnItem(ContentBlock),
     SetTurnTimestamp(Option<String>),
     FlushTurn { timestamp: Option<String> },
@@ -227,6 +244,8 @@ pub(crate) struct ParseState {
     pub metadata: SessionMetadata,
     pub turn_items: Vec<ContentBlock>,
     pub turn_timestamp: Option<String>,
+    pub tool_call_timestamps: std::collections::HashMap<String, String>,
+    last_user_ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ParseState {
@@ -243,12 +262,40 @@ impl ParseState {
             metadata: SessionMetadata::default(),
             turn_items: Vec::new(),
             turn_timestamp: None,
+            tool_call_timestamps: std::collections::HashMap::new(),
+            last_user_ts: None,
         }
+    }
+
+    pub(crate) fn parse_ts(iso: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+        iso?.parse().ok()
+    }
+
+    pub(crate) fn ms_between(
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<u64> {
+        let ms = to?.signed_duration_since(from?).num_milliseconds();
+        (ms > 0).then_some(ms as u64)
+    }
+
+    fn push_message(&mut self, mut msg: Message) {
+        let ts = Self::parse_ts(msg.timestamp.as_deref());
+
+        if msg.role == Role::User {
+            self.last_user_ts = ts.or(self.last_user_ts);
+        }
+
+        if msg.role == Role::Assistant && msg.duration_ms.is_none() {
+            msg.duration_ms = Self::ms_between(self.last_user_ts, ts);
+        }
+
+        self.messages.push(msg);
     }
 
     pub fn apply(&mut self, event: ParseEvent) {
         match event {
-            ParseEvent::AddMessage(msg) => self.messages.push(msg),
+            ParseEvent::AddMessage(msg) => self.push_message(msg),
             ParseEvent::SetTitle(t) => { self.title.get_or_insert(t); }
             ParseEvent::SetModel(m) => { self.model.get_or_insert(m); }
             ParseEvent::SetStartedAt(ts) => { self.started_at.get_or_insert(ts); }
@@ -265,22 +312,27 @@ impl ParseState {
             ParseEvent::AttachToolOutputById { tool_call_id, output, duration_ms } => {
                 attach_tool_output_by_id(&mut self.messages, &tool_call_id, output, duration_ms);
             }
-            ParseEvent::AttachToolOutputBySuffix { suffix, output } => {
-                attach_tool_output_by_suffix(&mut self.turn_items, &mut self.messages, &suffix, output);
+            ParseEvent::AttachToolOutputBySuffix { suffix, output, duration_ms } => {
+                attach_tool_output_by_suffix(&mut self.turn_items, &mut self.messages, &suffix, output, duration_ms);
             }
             ParseEvent::PushTurnItem(block) => self.turn_items.push(block),
             ParseEvent::SetTurnTimestamp(ts) => self.turn_timestamp = ts,
             ParseEvent::FlushTurn { timestamp } => {
                 if !self.turn_items.is_empty() {
-                    self.messages.push(Message {
+                    let start = Self::parse_ts(self.turn_timestamp.as_deref())
+                        .or(self.last_user_ts);
+                    let end_ts = timestamp.or(self.turn_timestamp.take());
+                    let end = Self::parse_ts(end_ts.as_deref());
+                    let content = std::mem::take(&mut self.turn_items);
+                    self.push_message(Message {
                         id: uuid::Uuid::new_v4().to_string(),
                         role: Role::Assistant,
-                        timestamp: timestamp.or(self.turn_timestamp.take()),
-                        content: std::mem::take(&mut self.turn_items),
+                        timestamp: end_ts,
+                        content,
                         mode: self.current_mode,
                         is_agent: false,
                         is_meta: false,
-                        duration_ms: None,
+                        duration_ms: Self::ms_between(start, end),
                     });
                 }
                 self.turn_timestamp = None;
@@ -290,23 +342,12 @@ impl ParseState {
 
     fn into_session(mut self, path: &Path, source: SessionSource) -> Session {
         if !self.turn_items.is_empty() {
-            self.messages.push(Message {
-                id: uuid::Uuid::new_v4().to_string(),
-                role: Role::Assistant,
-                timestamp: self.turn_timestamp.take(),
-                content: std::mem::take(&mut self.turn_items),
-                mode: self.current_mode,
-                is_agent: false,
-                is_meta: false,
-                duration_ms: None,
-            });
+            self.apply(ParseEvent::FlushTurn { timestamp: None });
         }
 
         if self.title.is_none() {
             self.title = title_from_first_user_message(&self.messages);
         }
-
-        calculate_durations(&mut self.messages);
 
         let token_usage = match self.token_usage_override {
             Some(tu) => tu,
@@ -347,14 +388,16 @@ fn attach_tool_output_by_suffix(
     messages: &mut [Message],
     suffix: &str,
     output: Option<String>,
+    duration_ms: Option<u64>,
 ) {
     let block = find_tool_by_suffix(turn_items, suffix)
         .or_else(|| messages.iter_mut().rev()
             .find_map(|msg| find_tool_by_suffix(&mut msg.content, suffix)));
 
-    if let Some(ContentBlock::ToolUse { tool_name, output: out, .. }) = block {
+    if let Some(ContentBlock::ToolUse { tool_name, output: out, duration_ms: dur, .. }) = block {
         *tool_name = tool_name.strip_suffix(suffix).unwrap_or(tool_name).to_string();
         *out = output;
+        *dur = duration_ms;
     }
 }
 
@@ -410,40 +453,3 @@ where
     state
 }
 
-/// Calculates message and tool durations from consecutive timestamps.
-pub fn calculate_durations(messages: &mut [Message]) {
-    let parsed: Vec<Option<chrono::DateTime<chrono::Utc>>> = messages
-        .iter()
-        .map(|m| m.timestamp.as_deref().and_then(|ts| ts.parse().ok()))
-        .collect();
-
-    for i in 1..messages.len() {
-        if messages[i].duration_ms.is_some() {
-            continue;
-        }
-        if let (Some(prev), Some(curr)) = (parsed[i - 1], parsed[i]) {
-            let ms = curr.signed_duration_since(prev).num_milliseconds();
-            if ms > 0 {
-                messages[i].duration_ms = Some(ms as u64);
-            }
-        }
-    }
-
-    for (i, msg) in messages.iter_mut().enumerate() {
-        let (Some(from), Some(to)) = (parsed.get(i).copied().flatten(), parsed.get(i + 1).copied().flatten()) else {
-            continue;
-        };
-        let ms = to.signed_duration_since(from).num_milliseconds();
-        if ms <= 0 {
-            continue;
-        }
-        let dur = Some(ms as u64);
-        for block in msg.content.iter_mut() {
-            if let ContentBlock::ToolUse { duration_ms, .. } = block {
-                if duration_ms.is_none() {
-                    *duration_ms = dur;
-                }
-            }
-        }
-    }
-}
